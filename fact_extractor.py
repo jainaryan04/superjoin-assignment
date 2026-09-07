@@ -18,21 +18,36 @@ Return ONLY valid JSON with this shape:
 Each fact must use this generic schema (no domain-specific fields):
 {
   "entity": "the subject the fact is about",
-  "attribute": "the property or relation name, in snake_case or short phrase",
+  "attribute": "the measured property (never a year or period name)",
   "value": "the extracted value as a string",
   "unit": "unit of measure if present, otherwise null",
-  "period": "time period or date if present, otherwise null",
+  "period": "time period or date if present (FY2024, Q1, 2024), otherwise null",
   "confidence": number between 0 and 1,
-  "evidence_text": "verbatim quote from the provided text that supports the fact"
+  "evidence_snippets": ["verbatim quote from the provided text", "..."]
 }
 
 Rules:
 - Extract only facts that are explicitly stated.
+- Separate ATTRIBUTE from PERIOD. Period is temporal metadata only.
+- Never use fiscal_year, fy, year, date, or period as the attribute name.
+- If the text is "Revenue FY2024 = ₹120 crore", emit:
+  entity=Revenue, attribute=total_revenue, value=₹120 crore, period=FY2024
+- Revenue metrics use these attribute names when they match the text:
+  total_revenue, product_revenue, services_revenue, subscription_revenue, licensing_revenue
 - Do not invent attributes such as industry-specific fields unless they appear in the text.
-- entity, attribute, value, and evidence_text are required.
-- evidence_text MUST be copied from the source text, not paraphrased.
+- entity, attribute, value, and at least one evidence snippet are required.
+- Every evidence snippet MUST be copied from the source text, not paraphrased.
+- Include every distinct supporting quote in evidence_snippets.
 - If nothing extractable exists, return {"facts": []}.
 """
+
+
+@dataclass
+class FactEvidence:
+    source_document: str
+    page_number: int
+    evidence_text: str
+    confidence: float
 
 
 @dataclass
@@ -44,12 +59,16 @@ class Fact:
     unit: str | None
     period: str | None
     confidence: float
-    source_document: str
-    page_number: int
-    evidence_text: str
+    evidence: list[FactEvidence]
 
     def to_record(self) -> dict[str, Any]:
-        return asdict(self)
+        record = asdict(self)
+        if self.evidence:
+            primary = self.evidence[0]
+            record["source_document"] = primary.source_document
+            record["page_number"] = primary.page_number
+            record["evidence_text"] = primary.evidence_text
+        return record
 
 
 class LLMClient(ABC):
@@ -110,22 +129,23 @@ class FactExtractor:
         self.llm = llm
 
     def extract_from_chunks(self, chunks: list[DocumentChunk]) -> list[Fact]:
-        facts: list[Fact] = []
-        seen: set[tuple[str, str, str, str, int]] = set()
+        by_identity: dict[tuple[str, str, str, str, str], Fact] = {}
         for chunk in chunks:
             for fact in self.extract_from_chunk(chunk):
                 key = (
                     fact.entity.lower(),
                     fact.attribute.lower(),
                     fact.value.lower(),
-                    fact.source_document,
-                    fact.page_number,
+                    (fact.unit or "").lower(),
+                    (fact.period or "").lower(),
                 )
-                if key in seen:
+                existing = by_identity.get(key)
+                if existing is None:
+                    by_identity[key] = fact
                     continue
-                seen.add(key)
-                facts.append(fact)
-        return facts
+                existing.evidence.extend(fact.evidence)
+                existing.confidence = max(existing.confidence, fact.confidence)
+        return list(by_identity.values())
 
     def extract_from_chunk(self, chunk: DocumentChunk) -> list[Fact]:
         user_prompt = (
@@ -173,11 +193,29 @@ def _to_fact(item: Any, chunk: DocumentChunk) -> Fact | None:
     entity = _clean_str(item.get("entity"))
     attribute = _clean_str(item.get("attribute"))
     value = _clean_str(item.get("value"))
-    evidence = _clean_str(item.get("evidence_text"))
-    if not entity or not attribute or not value or not evidence:
+    if not entity or not attribute or not value:
         return None
 
-    evidence = _align_evidence(evidence, chunk.text)
+    confidence = _clamp_confidence(item.get("confidence"))
+    snippets = _collect_snippets(item)
+    evidence: list[FactEvidence] = []
+    seen: set[str] = set()
+    for snippet in snippets:
+        aligned = _align_evidence(snippet, chunk.text)
+        if not aligned:
+            continue
+        key = aligned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        evidence.append(
+            FactEvidence(
+                source_document=chunk.source_document,
+                page_number=chunk.page_number,
+                evidence_text=aligned,
+                confidence=confidence,
+            )
+        )
     if not evidence:
         return None
 
@@ -188,11 +226,18 @@ def _to_fact(item: Any, chunk: DocumentChunk) -> Fact | None:
         value=value,
         unit=_optional_str(item.get("unit")),
         period=_optional_str(item.get("period")),
-        confidence=_clamp_confidence(item.get("confidence")),
-        source_document=chunk.source_document,
-        page_number=chunk.page_number,
-        evidence_text=evidence,
+        confidence=confidence,
+        evidence=evidence,
     )
+
+
+def _collect_snippets(item: dict[str, Any]) -> list[str]:
+    snippets: list[str] = []
+    raw_list = item.get("evidence_snippets")
+    if isinstance(raw_list, list):
+        snippets.extend(_clean_str(part) for part in raw_list)
+    snippets.append(_clean_str(item.get("evidence_text")))
+    return [part for part in snippets if part]
 
 
 def _align_evidence(evidence: str, source_text: str) -> str | None:

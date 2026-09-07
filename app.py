@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from database import (
     clear_all_facts,
     delete_facts_for_document,
+    get_fact,
     init_db,
     insert_facts,
     list_source_documents,
@@ -16,6 +17,8 @@ from database import (
 )
 from fact_extractor import FactExtractor, client_from_settings
 from pdf_processor import process_pdf
+from provenance_service import link_fact_relationships
+from fact_details import render_fact_details
 
 load_dotenv()
 init_db()
@@ -100,9 +103,16 @@ if st.button("Extract facts", type="primary", disabled=not uploaded_files):
                 document_facts.extend(extractor.extract_from_chunk(chunk))
 
             records = [fact.to_record() for fact in document_facts]
-            insert_facts(records)
-            total_facts += len(records)
-            st.write(f"Stored {len(records)} facts from `{source_name}`.")
+            stored = insert_facts(records)
+            link_result = link_fact_relationships(
+                source_name,
+                llm=extractor.llm,
+            )
+            total_facts += stored
+            st.write(
+                f"Stored {stored} canonical facts from `{source_name}` "
+                f"and added {link_result['relationships_added']} relationship(s)."
+            )
 
         progress.progress(1.0, text="Done")
         status.success(f"Extracted {total_facts} facts from {len(uploaded_files)} PDF(s).")
@@ -111,6 +121,7 @@ if st.button("Extract facts", type="primary", disabled=not uploaded_files):
 
 st.divider()
 st.subheader("Facts")
+st.caption("Select a row to inspect evidence text and related facts.")
 
 documents = list_source_documents()
 filter_cols = st.columns([2, 1])
@@ -128,27 +139,57 @@ rows = search_facts(query=query, source_document=source_filter)
 if not rows:
     st.info("No facts yet. Upload PDFs and run extraction.")
 else:
+    if st.session_state.pop("returning_from_detail", False):
+        st.session_state["facts_table_nonce"] = st.session_state.get("facts_table_nonce", 0) + 1
+
     frame = pd.DataFrame(rows)
     display_columns = [
         "entity",
+        "raw_attribute",
+        "canonical_attribute",
+        "original_value",
         "attribute",
         "value",
         "unit",
         "period",
         "confidence",
+        "document_count",
+        "evidence_count",
+        "relationship_count",
         "source_document",
         "page_number",
         "evidence_text",
         "id",
     ]
-    st.dataframe(
+    event = st.dataframe(
         frame[display_columns],
         use_container_width=True,
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"facts_table_{st.session_state.get('facts_table_nonce', 0)}",
         column_config={
             "confidence": st.column_config.NumberColumn(format="%.2f"),
             "page_number": st.column_config.NumberColumn(format="%d"),
+            "document_count": st.column_config.NumberColumn("documents", format="%d"),
+            "evidence_count": st.column_config.NumberColumn("evidence", format="%d"),
+            "relationship_count": st.column_config.NumberColumn("relationships", format="%d"),
             "evidence_text": st.column_config.TextColumn(width="large"),
         },
     )
-    st.caption(f"{len(rows)} fact(s) shown. Every row includes evidence text and a page number.")
+    st.caption(
+        f"{len(rows)} fact(s) shown. Evidence count is the number of source snippets, "
+        "not related facts. Select a row to open Fact Details."
+    )
+
+    selected_rows = event.selection.rows if event.selection else []
+    if selected_rows:
+        selected_id = str(frame.iloc[selected_rows[0]]["id"])
+        st.session_state["selected_fact_id"] = selected_id
+        st.query_params["fact_id"] = selected_id
+        fact = get_fact(selected_id)
+        if fact:
+            st.divider()
+            render_fact_details(fact)
+            if st.button("Open full fact detail page"):
+                st.switch_page("pages/fact_detail.py")
