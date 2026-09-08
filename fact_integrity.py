@@ -39,7 +39,7 @@ def integrity_status(fact: dict[str, Any], cohort: list[dict[str, Any]] | None =
     stored_attr = str(fact.get("canonical_attribute") or fact.get("attribute") or "").strip()
     stored_value = str(fact.get("value") or "").strip()
     reasons: list[str] = []
-    if _norm(stored_value) != _norm(original_value):
+    if _norm(stored_value) != _norm(expected.get("value")):
         reasons.append("Value changed after extraction.")
     if stored_attr != expected["canonical_attribute"]:
         reasons.append(

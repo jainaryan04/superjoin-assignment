@@ -16,12 +16,14 @@ from database import (
     deduplicate_equivalent_facts,
     init_db,
     migrate_canonical_columns,
+    migrate_embeddings,
     migrate_fact_evidence,
     migrate_fact_relationships,
     search_facts,
     list_all_relationships,
 )
 from provenance_service import rebuild_relationships
+from semantic_search_service import index_all_facts
 
 
 def main() -> None:
@@ -32,9 +34,11 @@ def main() -> None:
     migrate_fact_evidence(db_path=args.db)
     migrate_fact_relationships(db_path=args.db)
     migrate_canonical_columns(db_path=args.db)
+    migrate_embeddings(db_path=args.db)
     deduped = deduplicate_equivalent_facts(db_path=args.db)
     cleaned = cleanup_relationships(db_path=args.db)
     rebuilt = rebuild_relationships(db_path=str(args.db))
+    indexed = index_all_facts(args.db)
     facts = search_facts(db_path=args.db)
     rels = list_all_relationships(db_path=args.db)
     print(f"Migrated {args.db}")
@@ -51,7 +55,8 @@ def main() -> None:
         f"Duplicate relationships removed: {rebuilt.get('duplicate_relationships_removed', 0)}\n"
         f"Self relationships removed: {rebuilt.get('self_relationships_removed', 0)}\n"
         f"Final facts stored: {len(facts)}\n"
-        f"Final relationships stored: {len(rels)}"
+        f"Final relationships stored: {len(rels)}\n"
+        f"Embeddings indexed: {indexed}"
     )
 
 

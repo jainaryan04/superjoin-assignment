@@ -35,7 +35,12 @@ Rules:
 - Revenue metrics use these attribute names when they match the text:
   total_revenue, product_revenue, services_revenue, subscription_revenue, licensing_revenue
 - Do not invent attributes such as industry-specific fields unless they appear in the text.
-- entity, attribute, value, and at least one evidence snippet are required.
+- If the text names a CEO, emit entity=CEO, attribute=holder, value=the person name.
+  "CEO: Rohit Sharma" and "Priya Mehta | position=CEO" both become
+  entity=CEO, attribute=holder, value=the person.
+- Employees / Employee Count / Headcount use attribute=employee_count.
+- Software products map to product_revenue; consulting services map to services_revenue;
+  annual revenue maps to total_revenue.
 - Every evidence snippet MUST be copied from the source text, not paraphrased.
 - Include every distinct supporting quote in evidence_snippets.
 - If nothing extractable exists, return {"facts": []}.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from pathlib import Path
@@ -17,8 +18,18 @@ RELATIONSHIP_TYPES = (
     "CONTRADICTS",
     "RECONCILES",
     "TEMPORAL_SUCCESSOR",
+    "COMPUTED_SUPPORT",
+    "POTENTIAL_CONTRADICTION",
+    "UNRESOLVED_DIFFERENCE",
 )
 TYPE_RANK = {name: index for index, name in enumerate(EVIDENCE_TYPES)}
+UNDIRECTED_RELATIONSHIP_TYPES = {
+    "CORROBORATES",
+    "CONTRADICTS",
+    "RECONCILES",
+    "POTENTIAL_CONTRADICTION",
+    "UNRESOLVED_DIFFERENCE",
+}
 
 TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -60,9 +71,35 @@ CREATE TABLE IF NOT EXISTS fact_relationships (
     relationship_type TEXT NOT NULL,
     confidence REAL NOT NULL,
     reasoning TEXT,
+    pair_low TEXT,
+    pair_high TEXT,
+    supporting_fact_ids TEXT,
+    supporting_evidence_ids TEXT,
+    computed_components TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE CASCADE,
     FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS fact_clusters (
+    id TEXT PRIMARY KEY,
+    canonical_attribute TEXT NOT NULL,
+    canonical_value TEXT NOT NULL,
+    period TEXT,
+    supporting_documents TEXT,
+    supporting_fact_ids TEXT,
+    document_count INTEGER NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+    fact_id TEXT PRIMARY KEY,
+    faiss_id INTEGER NOT NULL UNIQUE,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
 );
 """
 
@@ -80,6 +117,11 @@ CREATE INDEX IF NOT EXISTS idx_rel_source ON fact_relationships(source_fact_id);
 CREATE INDEX IF NOT EXISTS idx_rel_target ON fact_relationships(target_fact_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_unique
     ON fact_relationships(source_fact_id, target_fact_id, relationship_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_pair
+    ON fact_relationships(relationship_type, pair_low, pair_high);
+CREATE INDEX IF NOT EXISTS idx_cluster_attr ON fact_clusters(canonical_attribute, period);
+CREATE INDEX IF NOT EXISTS idx_embed_faiss ON fact_embeddings(faiss_id);
+CREATE INDEX IF NOT EXISTS idx_embed_hash ON fact_embeddings(text_hash, model);
 """
 
 SCHEMA = TABLE_SCHEMA + INDEX_SCHEMA
@@ -106,6 +148,10 @@ def init_db(db_path: Path | str | None = None) -> None:
         conn.executescript(TABLE_SCHEMA)
         migrate_fact_evidence(conn)
         migrate_canonical_columns(conn)
+        # Must precede migrate_embeddings: it adds fact_relationships.pair_low/pair_high,
+        # and migrate_embeddings runs INDEX_SCHEMA which indexes those columns.
+        migrate_relationship_quality(conn)
+        migrate_embeddings(conn)
         if needs_relationship_backfill:
             _strip_cross_fact_evidence(conn)
         deduplicate_equivalent_facts(conn)
@@ -190,6 +236,59 @@ def migrate_canonical_columns(
             conn.close()
 
 
+def migrate_embeddings(
+    conn: sqlite3.Connection | None = None, db_path: Path | str | None = None
+) -> None:
+    """Create the compact fact_embeddings table used by FAISS."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = get_connection(db_path)
+    assert conn is not None
+    try:
+        conn.executescript(TABLE_SCHEMA)
+        conn.executescript(INDEX_SCHEMA)
+        if owns_connection:
+            conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+RELATIONSHIP_EXTRA_COLUMNS = {
+    "pair_low": "TEXT",
+    "pair_high": "TEXT",
+    "supporting_fact_ids": "TEXT",
+    "supporting_evidence_ids": "TEXT",
+    "computed_components": "TEXT",
+}
+
+
+def migrate_relationship_quality(
+    conn: sqlite3.Connection | None = None, db_path: Path | str | None = None
+) -> None:
+    """Add pair keys, support IDs, computed components, and cluster table."""
+    owns_connection = conn is None
+    if owns_connection:
+        conn = get_connection(db_path)
+    assert conn is not None
+    try:
+        conn.executescript(TABLE_SCHEMA)
+        if "fact_relationships" in _table_names(conn):
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(fact_relationships)").fetchall()
+            }
+            for name, typedef in RELATIONSHIP_EXTRA_COLUMNS.items():
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE fact_relationships ADD COLUMN {name} {typedef}")
+        _backfill_relationship_pairs(conn)
+        conn.executescript(INDEX_SCHEMA)
+        if owns_connection:
+            conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
 def reprocess_fact_canonicalization(conn: sqlite3.Connection) -> int:
     """Repair canonical fields from the immutable original snapshot.
 
@@ -198,7 +297,7 @@ def reprocess_fact_canonicalization(conn: sqlite3.Connection) -> int:
     """
     from canonicalization_service import canonicalize_fact
 
-    rows = conn.execute("SELECT * FROM facts").fetchall()
+    rows = conn.execute("SELECT * FROM facts ORDER BY created_at, id").fetchall()
     updated = 0
     for row in rows:
         fact = dict(row)
@@ -234,6 +333,8 @@ def reprocess_fact_canonicalization(conn: sqlite3.Connection) -> int:
             original_value,
             prepared.get("unit"),
             prepared.get("period"),
+            _primary_source(conn, fact["id"]),
+            original_attribute,
         )
         collision = conn.execute(
             "SELECT id FROM facts WHERE identity_key = ? AND id != ?",
@@ -362,7 +463,15 @@ def _merge_fact_into(conn: sqlite3.Connection, source_id: str, target_id: str) -
     entity = keeper["canonical_entity"] or keeper["entity"]
     attribute = keeper["canonical_attribute"] or keeper["attribute"]
     value = keeper["canonical_value"] or keeper["value"]
-    key = identity_key(entity, attribute, value, keeper["unit"], period)
+    key = identity_key(
+        entity,
+        attribute,
+        value,
+        keeper["unit"],
+        period,
+        _primary_source(conn, target_id),
+        keeper["original_attribute"] or keeper["raw_attribute"],
+    )
     collision = conn.execute(
         "SELECT id FROM facts WHERE identity_key = ? AND id != ?",
         (key, target_id),
@@ -376,6 +485,8 @@ def _merge_fact_into(conn: sqlite3.Connection, source_id: str, target_id: str) -
         """,
         (period, confidence, key, target_id),
     )
+    if "fact_embeddings" in _table_names(conn):
+        conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (source_id,))
     conn.execute("DELETE FROM facts WHERE id = ?", (source_id,))
     _refresh_fact_confidence(conn, target_id)
 
@@ -390,12 +501,33 @@ def _merge_reasoning(*parts: Any) -> str | None:
 
 
 def _fact_equivalence_key(fact: dict[str, Any]) -> tuple[str, str, str]:
+    """Canonical equivalence identity, independent of source document.
+
+    Period is not part of the key; callers gate period compatibility separately
+    (``_find_equivalent_fact`` via ``periods_mergeable`` and
+    ``deduplicate_equivalent_facts`` by splitting multi-period groups), which lets
+    a period-less fact absorb into its dated twin while keeping distinct explicit
+    periods apart.
+    """
     from canonicalization_service import normalized_value_key
 
     entity = _norm(str(fact.get("canonical_entity") or fact.get("entity") or ""))
     attribute = _norm(str(fact.get("canonical_attribute") or fact.get("attribute") or ""))
     value = normalized_value_key(fact.get("canonical_value") or fact.get("value"), fact.get("unit"))
     return entity, attribute, value
+
+
+def _primary_source(conn: sqlite3.Connection, fact_id: str) -> str:
+    row = conn.execute(
+        """
+        SELECT source_document FROM fact_evidence
+        WHERE fact_id = ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        """,
+        (fact_id,),
+    ).fetchone()
+    return str(row["source_document"] if row else "")
 
 
 def _find_equivalent_fact(
@@ -405,7 +537,7 @@ def _find_equivalent_fact(
 
     target_key = _fact_equivalence_key(fact)
     period = fact.get("period")
-    rows = conn.execute("SELECT * FROM facts").fetchall()
+    rows = conn.execute("SELECT * FROM facts ORDER BY created_at, id").fetchall()
     for row in rows:
         if exclude_id and row["id"] == exclude_id:
             continue
@@ -428,9 +560,13 @@ def deduplicate_equivalent_facts(
     try:
         if "facts" not in _table_names(conn):
             return {"facts_merged": 0, "facts_remaining": 0}
-        rows = [dict(row) for row in conn.execute("SELECT * FROM facts").fetchall()]
+        rows = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM facts ORDER BY created_at, id").fetchall()
+        ]
         groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for fact in rows:
+            fact["source_document"] = _primary_source(conn, fact["id"])
             groups.setdefault(_fact_equivalence_key(fact), []).append(fact)
         for group in groups.values():
             if len(group) < 2:
@@ -460,16 +596,33 @@ def deduplicate_equivalent_facts(
             conn.close()
 
 
+def _merge_cluster_rank_key(
+    conn: sqlite3.Connection, fact: dict[str, Any]
+) -> tuple[int, int, str, str]:
+    """Deterministic representative selection.
+
+    Order of preference: a fact that already carries a period beats an undated
+    one, then most evidence records, then oldest insertion timestamp, then
+    smallest fact id. Every key is deterministic, so the surviving row (and any
+    metadata reasoning derives from it) is stable across merge order.
+    """
+    has_period = 0 if str(fact.get("period") or "").strip() else 1
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM fact_evidence WHERE fact_id = ?", (fact["id"],)
+    ).fetchone()
+    evidence_count = int((row["n"] if row else 0) or 0)
+    return (
+        has_period,
+        -evidence_count,
+        str(fact.get("created_at") or ""),
+        str(fact.get("id") or ""),
+    )
+
+
 def _merge_fact_cluster(conn: sqlite3.Connection, group: list[dict[str, Any]]) -> int:
     if len(group) < 2:
         return 0
-    ranked = sorted(
-        group,
-        key=lambda item: (
-            0 if str(item.get("period") or "").strip() else 1,
-            str(item.get("id") or ""),
-        ),
-    )
+    ranked = sorted(group, key=lambda item: _merge_cluster_rank_key(conn, item))
     keeper = ranked[0]
     merged = 0
     for item in ranked[1:]:
@@ -557,13 +710,28 @@ def insert_facts(facts: list[dict[str, Any]], db_path: Path | str | None = None)
             prepared["original_attribute"] = original_attribute
             prepared["original_value"] = original_value
             prepared["original_period"] = original_period
-            prepared["value"] = original_value
+            prepared["source_document"] = (
+                evidence_items[0].get("source_document")
+                if evidence_items
+                else prepared.get("source_document")
+            )
             fact_id = _upsert_fact(conn, prepared)
             for item in evidence_items:
                 _insert_evidence(conn, fact_id, item)
             _refresh_fact_confidence(conn, fact_id)
             touched.add(fact_id)
+        # Collapse any equivalents that arrived in separate insert_facts() calls
+        # (one call per document) into a single canonical fact with merged evidence.
+        if touched:
+            deduplicate_equivalent_facts(conn)
         conn.commit()
+    if touched:
+        from semantic_search_service import index_fact_ids
+
+        # touched may name rows that were merged away; index_fact_ids skips missing
+        # ids, and embedding text is source-independent so keepers need no refresh.
+        index_fact_ids(sorted(touched), db_path)
+        rebuild_fact_clusters(db_path)
     return len(touched)
 
 
@@ -608,22 +776,54 @@ def relationship_exists(
 def _cleanup_relationship_rows(conn: sqlite3.Connection) -> tuple[int, int]:
     if "fact_relationships" not in _table_names(conn):
         return 0, 0
+    # Drop the uniqueness guards before backfilling pair keys: existing duplicates
+    # (e.g. a hand-inserted repeat of an already-keyed row) would otherwise trip the
+    # index mid-backfill, before the keep/drop dedup below gets to remove them. Both
+    # callers rebuild INDEX_SCHEMA immediately after this returns.
+    conn.execute("DROP INDEX IF EXISTS idx_rel_unique")
+    conn.execute("DROP INDEX IF EXISTS idx_rel_pair")
+    _backfill_relationship_pairs(conn)
     self_cur = conn.execute(
         "DELETE FROM fact_relationships WHERE source_fact_id = target_fact_id"
     )
-    dup_cur = conn.execute(
-        """
-        DELETE FROM fact_relationships
-        WHERE id NOT IN (
-            SELECT id FROM (
-                SELECT MIN(id) AS id
-                FROM fact_relationships
-                GROUP BY source_fact_id, target_fact_id, relationship_type
-            )
+    rows = [dict(row) for row in conn.execute("SELECT * FROM fact_relationships").fetchall()]
+    keep: dict[tuple[str, str, str], dict[str, Any]] = {}
+    drop: list[str] = []
+    for row in rows:
+        rel_type = str(row.get("relationship_type") or "")
+        source_id = str(row.get("source_fact_id") or "")
+        target_id = str(row.get("target_fact_id") or "")
+        components = _parse_id_list(row.get("computed_components"))
+        low, high = relationship_pair_bounds(source_id, target_id, rel_type, components)
+        key = (rel_type, low, high)
+        current = keep.get(key)
+        if current is None:
+            keep[key] = row
+            continue
+        if float(row.get("confidence") or 0) > float(current.get("confidence") or 0):
+            drop.append(str(current["id"]))
+            keep[key] = row
+        else:
+            drop.append(str(row["id"]))
+    for rel_id in drop:
+        conn.execute("DELETE FROM fact_relationships WHERE id = ?", (rel_id,))
+    for row in keep.values():
+        rel_type = str(row.get("relationship_type") or "")
+        source_id = str(row.get("source_fact_id") or "")
+        target_id = str(row.get("target_fact_id") or "")
+        components = _parse_id_list(row.get("computed_components"))
+        low, high, stored_source, stored_target = _canonical_pair(
+            source_id, target_id, rel_type, components
         )
-        """
-    )
-    return int(self_cur.rowcount or 0), int(dup_cur.rowcount or 0)
+        conn.execute(
+            """
+            UPDATE fact_relationships
+            SET pair_low = ?, pair_high = ?, source_fact_id = ?, target_fact_id = ?
+            WHERE id = ?
+            """,
+            (low, high, stored_source, stored_target, row["id"]),
+        )
+    return int(self_cur.rowcount or 0), len(drop)
 
 
 def cleanup_relationships(db_path: Path | str | None = None) -> dict[str, int]:
@@ -631,12 +831,8 @@ def cleanup_relationships(db_path: Path | str | None = None) -> dict[str, int]:
     with get_connection(db_path) as conn:
         self_removed, duplicate_removed = _cleanup_relationship_rows(conn)
         conn.execute("DROP INDEX IF EXISTS idx_rel_unique")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_unique
-            ON fact_relationships(source_fact_id, target_fact_id, relationship_type)
-            """
-        )
+        conn.execute("DROP INDEX IF EXISTS idx_rel_pair")
+        conn.executescript(INDEX_SCHEMA)
         remaining = conn.execute("SELECT COUNT(*) AS n FROM fact_relationships").fetchone()["n"]
         conn.commit()
     return {
@@ -683,6 +879,11 @@ def list_all_relationships(db_path: Path | str | None = None) -> list[dict[str, 
                 r.relationship_type,
                 r.confidence,
                 r.reasoning,
+                r.pair_low,
+                r.pair_high,
+                r.supporting_fact_ids,
+                r.supporting_evidence_ids,
+                r.computed_components,
                 sf.entity AS source_entity,
                 sf.attribute AS source_attribute,
                 sf.raw_attribute AS source_raw_attribute,
@@ -744,6 +945,7 @@ def list_all_relationships(db_path: Path | str | None = None) -> list[dict[str, 
             }
             item["source_statement"] = item["source_fact"]
             item["target_statement"] = item["target_fact"]
+            _hydrate_relationship_payload(item)
             _decorate_relationship(item)
             results.append(item)
         return results
@@ -762,18 +964,20 @@ def find_self_links(db_path: Path | str | None = None) -> list[dict[str, Any]]:
 
 
 def find_duplicate_relationships(db_path: Path | str | None = None) -> list[dict[str, Any]]:
-    """Groups with more than one row for the same source, target, and type."""
+    """Groups with more than one row for the same undirected/directional pair key."""
     with get_connection(db_path) as conn:
+        if "fact_relationships" not in _table_names(conn):
+            return []
         rows = conn.execute(
             """
             SELECT
-                source_fact_id,
-                target_fact_id,
                 relationship_type,
+                pair_low,
+                pair_high,
                 COUNT(*) AS duplicate_count,
                 GROUP_CONCAT(id) AS relationship_ids
             FROM fact_relationships
-            GROUP BY source_fact_id, target_fact_id, relationship_type
+            GROUP BY relationship_type, pair_low, pair_high
             HAVING COUNT(*) > 1
             """
         ).fetchall()
@@ -781,24 +985,9 @@ def find_duplicate_relationships(db_path: Path | str | None = None) -> list[dict
 
 
 def delete_duplicate_relationships(db_path: Path | str | None = None) -> int:
-    """Keep the highest-confidence row in each duplicate group."""
-    duplicates = find_duplicate_relationships(db_path)
-    if not duplicates:
-        return 0
-    removed = 0
+    """Keep the highest-confidence row in each duplicate pair group."""
     with get_connection(db_path) as conn:
-        for group in duplicates:
-            rows = conn.execute(
-                """
-                SELECT id FROM fact_relationships
-                WHERE source_fact_id = ? AND target_fact_id = ? AND relationship_type = ?
-                ORDER BY confidence DESC, id ASC
-                """,
-                (group["source_fact_id"], group["target_fact_id"], group["relationship_type"]),
-            ).fetchall()
-            for extra in rows[1:]:
-                conn.execute("DELETE FROM fact_relationships WHERE id = ?", (extra["id"],))
-                removed += 1
+        _, removed = _cleanup_relationship_rows(conn)
         conn.commit()
     return removed
 
@@ -861,6 +1050,8 @@ def search_facts(
                 f.attribute LIKE ? OR
                 IFNULL(f.raw_attribute, '') LIKE ? OR
                 IFNULL(f.canonical_attribute, '') LIKE ? OR
+                IFNULL(f.canonical_entity, '') LIKE ? OR
+                IFNULL(f.canonical_value, '') LIKE ? OR
                 f.value LIKE ? OR
                 IFNULL(f.unit, '') LIKE ? OR
                 IFNULL(f.period, '') LIKE ? OR
@@ -875,7 +1066,7 @@ def search_facts(
             )
             """
         )
-        params.extend([like] * 9)
+        params.extend([like] * 11)
 
     if source_document:
         clauses.append(
@@ -924,6 +1115,11 @@ def search_facts(
                 FROM fact_evidence e_type
                 WHERE e_type.fact_id = f.id
             ) AS evidence_types,
+            (
+                SELECT GROUP_CONCAT(DISTINCT e_docs.source_document)
+                FROM fact_evidence e_docs
+                WHERE e_docs.fact_id = f.id
+            ) AS supporting_documents_csv,
             primary_e.source_document,
             primary_e.page_number,
             primary_e.evidence_text,
@@ -952,7 +1148,15 @@ def search_facts(
     """
     with get_connection(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            csv = item.pop("supporting_documents_csv", None) or ""
+            item["supporting_documents"] = sorted(
+                {part.strip() for part in csv.split(",") if part.strip()}
+            )
+            results.append(item)
+        return results
 
 
 def get_fact(fact_id: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
@@ -1003,6 +1207,13 @@ def get_fact(fact_id: str, db_path: Path | str | None = None) -> dict[str, Any] 
         fact = dict(row)
         fact["evidence"] = _list_evidence(conn, fact_id)
         fact["relationships"] = _list_relationships(conn, fact_id)
+        fact["supporting_documents"] = sorted(
+            {
+                str(item["source_document"])
+                for item in fact["evidence"]
+                if item.get("source_document")
+            }
+        )
         return fact
 
 
@@ -1102,6 +1313,8 @@ def delete_facts_for_document(source_document: str, db_path: Path | str | None =
                     """,
                     (fact_id, fact_id),
                 )
+                if "fact_embeddings" in _table_names(conn):
+                    conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
                 conn.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
             else:
                 _refresh_fact_confidence(conn, fact_id)
@@ -1112,18 +1325,109 @@ def clear_all_facts(db_path: Path | str | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.execute("DELETE FROM fact_relationships")
         conn.execute("DELETE FROM fact_evidence")
+        if "fact_embeddings" in _table_names(conn):
+            conn.execute("DELETE FROM fact_embeddings")
+        if "fact_clusters" in _table_names(conn):
+            conn.execute("DELETE FROM fact_clusters")
         conn.execute("DELETE FROM facts")
+        conn.commit()
+    from semantic_search_service import reset_faiss_index
+
+    reset_faiss_index(db_path)
+
+
+def list_fact_embeddings(db_path: Path | str | None = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as conn:
+        if "fact_embeddings" not in _table_names(conn):
+            return []
+        rows = conn.execute(
+            """
+            SELECT fact_id, faiss_id, model, dim, text_hash, embedding
+            FROM fact_embeddings
+            ORDER BY faiss_id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_fact_embedding(fact_id: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
+    with get_connection(db_path) as conn:
+        if "fact_embeddings" not in _table_names(conn):
+            return None
+        row = conn.execute(
+            """
+            SELECT fact_id, faiss_id, model, dim, text_hash, embedding
+            FROM fact_embeddings
+            WHERE fact_id = ?
+            """,
+            (fact_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_fact_embedding(
+    fact_id: str,
+    faiss_id: int,
+    model: str,
+    dim: int,
+    text_hash: str,
+    embedding: bytes,
+    db_path: Path | str | None = None,
+) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO fact_embeddings (
+                fact_id, faiss_id, model, dim, text_hash, embedding
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(fact_id) DO UPDATE SET
+                faiss_id = excluded.faiss_id,
+                model = excluded.model,
+                dim = excluded.dim,
+                text_hash = excluded.text_hash,
+                embedding = excluded.embedding
+            """,
+            (fact_id, faiss_id, model, dim, text_hash, embedding),
+        )
         conn.commit()
 
 
-def identity_key(entity: str, attribute: str, value: str, unit: str | None, period: str | None) -> str:
+def next_faiss_id(db_path: Path | str | None = None) -> int:
+    with get_connection(db_path) as conn:
+        if "fact_embeddings" not in _table_names(conn):
+            return 1
+        row = conn.execute(
+            "SELECT COALESCE(MAX(faiss_id), 0) AS n FROM fact_embeddings"
+        ).fetchone()
+        return int(row["n"] or 0) + 1
+
+
+def identity_key(
+    entity: str,
+    attribute: str,
+    value: str,
+    unit: str | None,
+    period: str | None,
+    source_document: str | None = None,
+    original_attribute: str | None = None,
+) -> str:
+    """Source-independent canonical identity for a fact.
+
+    Two facts share an identity when they have the same canonical entity, the same
+    canonical attribute, the same normalized value, and the same canonicalized
+    period. ``source_document`` and the raw attribute surface are deliberately
+    excluded so the same figure reported in multiple documents resolves to one
+    fact row carrying many evidence records. The trailing parameters are kept for
+    call-site compatibility and are intentionally ignored.
+    """
+    from canonicalization_service import canonicalize_period, normalized_value_key
+
     return "|".join(
         [
-            _norm(entity),
-            _norm(attribute),
-            _norm(value),
-            _norm(unit or ""),
-            _norm(period or ""),
+            _norm(str(entity or "")),
+            _norm(str(attribute or "")),
+            normalized_value_key(value, unit),
+            _norm(canonicalize_period(period or "")),
         ]
     )
 
@@ -1192,6 +1496,8 @@ def _upsert_fact(conn: sqlite3.Connection, fact: dict[str, Any]) -> str:
         fact.get("canonical_value") or fact["value"],
         fact.get("unit"),
         fact.get("period"),
+        fact.get("source_document"),
+        fact.get("original_attribute") or fact.get("raw_attribute"),
     )
     existing = conn.execute(
         "SELECT id FROM facts WHERE identity_key = ?",
@@ -1209,7 +1515,15 @@ def _upsert_fact(conn: sqlite3.Connection, fact: dict[str, Any]) -> str:
         entity = equivalent["canonical_entity"] or equivalent["entity"]
         attribute = equivalent["canonical_attribute"] or equivalent["attribute"]
         value = equivalent["canonical_value"] or equivalent["value"]
-        merged_key = identity_key(entity, attribute, value, equivalent["unit"], period)
+        merged_key = identity_key(
+            entity,
+            attribute,
+            value,
+            equivalent["unit"],
+            period,
+            fact.get("source_document") or _primary_source(conn, equivalent["id"]),
+            equivalent["original_attribute"] or equivalent["raw_attribute"],
+        )
         collision = conn.execute(
             "SELECT id FROM facts WHERE identity_key = ? AND id != ?",
             (merged_key, equivalent["id"]),
@@ -1249,7 +1563,7 @@ def _upsert_fact(conn: sqlite3.Connection, fact: dict[str, Any]) -> str:
             fact.get("original_attribute") or fact.get("raw_attribute") or fact["attribute"],
             fact.get("original_value") or fact["value"],
             fact.get("original_period") if fact.get("original_period") not in (None, "") else fact.get("period"),
-            fact.get("original_value") or fact["value"],
+            fact.get("value") or fact.get("original_value"),
             fact.get("unit"),
             fact.get("period"),
             float(fact.get("confidence") or 0.5),
@@ -1282,21 +1596,98 @@ def _insert_evidence(conn: sqlite3.Connection, fact_id: str, item: dict[str, Any
         return False
 
 
+        return False
+
+
+def relationship_pair_bounds(
+    source_id: str,
+    target_id: str,
+    rel_type: str,
+    components: list[str] | None = None,
+) -> tuple[str, str]:
+    if rel_type == "COMPUTED_SUPPORT":
+        parts = sorted({str(item) for item in (components or []) if item} | {str(target_id)})
+        return str(source_id), "|".join(parts)
+    if rel_type in UNDIRECTED_RELATIONSHIP_TYPES:
+        first, second = sorted((str(source_id), str(target_id)))
+        return first, second
+    return str(source_id), str(target_id)
+
+
+def _canonical_pair(
+    source_id: str,
+    target_id: str,
+    rel_type: str,
+    components: list[str] | None = None,
+) -> tuple[str, str, str, str]:
+    low, high = relationship_pair_bounds(source_id, target_id, rel_type, components)
+    if rel_type in UNDIRECTED_RELATIONSHIP_TYPES:
+        return low, high, low, high
+    return low, high, str(source_id), str(target_id)
+
+
+def _parse_id_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if str(item).strip()]
+    return []
+
+
+def _dump_id_list(value: Any) -> str:
+    return json.dumps(_parse_id_list(value), ensure_ascii=False)
+
+
+def _backfill_relationship_pairs(conn: sqlite3.Connection) -> None:
+    if "fact_relationships" not in _table_names(conn):
+        return
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(fact_relationships)").fetchall()}
+    if "pair_low" not in columns:
+        return
+    rows = conn.execute(
+        "SELECT id, source_fact_id, target_fact_id, relationship_type, computed_components FROM fact_relationships"
+    ).fetchall()
+    for row in rows:
+        low, high, source_id, target_id = _canonical_pair(
+            row["source_fact_id"],
+            row["target_fact_id"],
+            row["relationship_type"],
+            _parse_id_list(row["computed_components"] if "computed_components" in row.keys() else None),
+        )
+        conn.execute(
+            """
+            UPDATE fact_relationships
+            SET pair_low = ?, pair_high = ?, source_fact_id = ?, target_fact_id = ?
+            WHERE id = ?
+            """,
+            (low, high, source_id, target_id, row["id"]),
+        )
+
+
 def _relationship_exists(
     conn: sqlite3.Connection,
     source_id: str,
     target_id: str,
     rel_type: str | None,
+    components: list[str] | None = None,
 ) -> bool:
     if not source_id or not target_id or not rel_type:
         return False
+    low, high = relationship_pair_bounds(source_id, target_id, rel_type, components)
     row = conn.execute(
         """
         SELECT 1 FROM fact_relationships
-        WHERE source_fact_id = ? AND target_fact_id = ? AND relationship_type = ?
+        WHERE relationship_type = ? AND pair_low = ? AND pair_high = ?
         LIMIT 1
         """,
-        (source_id, target_id, rel_type),
+        (rel_type, low, high),
     ).fetchone()
     return row is not None
 
@@ -1307,25 +1698,46 @@ def _insert_relationship(conn: sqlite3.Connection, item: dict[str, Any]) -> bool
         return False
     source_id = str(item["source_fact_id"])
     target_id = str(item["target_fact_id"])
+    if source_id == target_id and rel_type != "COMPUTED_SUPPORT":
+        return False
+    components = _parse_id_list(item.get("computed_components"))
+    low, high, source_id, target_id = _canonical_pair(source_id, target_id, rel_type, components)
     if source_id == target_id:
         return False
     existing = conn.execute(
         """
-        SELECT id, confidence, reasoning FROM fact_relationships
-        WHERE source_fact_id = ? AND target_fact_id = ? AND relationship_type = ?
+        SELECT id, confidence, reasoning, supporting_fact_ids, supporting_evidence_ids,
+               computed_components
+        FROM fact_relationships
+        WHERE relationship_type = ? AND pair_low = ? AND pair_high = ?
         """,
-        (source_id, target_id, rel_type),
+        (rel_type, low, high),
     ).fetchone()
+    support_facts = _dump_id_list(
+        _parse_id_list(item.get("supporting_fact_ids"))
+        + (_parse_id_list(existing["supporting_fact_ids"]) if existing else [])
+    )
+    support_evidence = _dump_id_list(
+        _parse_id_list(item.get("supporting_evidence_ids"))
+        + (_parse_id_list(existing["supporting_evidence_ids"]) if existing else [])
+    )
+    component_json = _dump_id_list(components or (existing["computed_components"] if existing else []))
+    reasoning = str(item.get("reasoning") or "").strip() or None
+    confidence = float(item.get("confidence") or 0.7)
     if existing:
         conn.execute(
             """
             UPDATE fact_relationships
-            SET confidence = ?, reasoning = ?
+            SET confidence = ?, reasoning = ?, supporting_fact_ids = ?,
+                supporting_evidence_ids = ?, computed_components = ?
             WHERE id = ?
             """,
             (
-                max(float(existing["confidence"] or 0), float(item.get("confidence") or 0)),
-                _merge_reasoning(existing["reasoning"], item.get("reasoning")),
+                max(float(existing["confidence"] or 0), confidence),
+                _merge_reasoning(existing["reasoning"], reasoning),
+                support_facts,
+                support_evidence,
+                component_json,
                 existing["id"],
             ),
         )
@@ -1334,16 +1746,22 @@ def _insert_relationship(conn: sqlite3.Connection, item: dict[str, Any]) -> bool
         conn.execute(
             """
             INSERT INTO fact_relationships (
-                id, source_fact_id, target_fact_id, relationship_type, confidence, reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                id, source_fact_id, target_fact_id, relationship_type, confidence, reasoning,
+                pair_low, pair_high, supporting_fact_ids, supporting_evidence_ids, computed_components
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(item.get("id") or uuid.uuid4()),
                 source_id,
                 target_id,
                 rel_type,
-                float(item.get("confidence") or 0.7),
-                (str(item.get("reasoning") or "").strip() or None),
+                confidence,
+                reasoning,
+                low,
+                high,
+                support_facts,
+                support_evidence,
+                component_json,
             ),
         )
         return True
@@ -1361,6 +1779,9 @@ def _list_relationships(conn: sqlite3.Connection, fact_id: str) -> list[dict[str
             r.relationship_type,
             r.confidence,
             r.reasoning,
+            r.supporting_fact_ids,
+            r.supporting_evidence_ids,
+            r.computed_components,
             sf.entity AS source_entity,
             sf.attribute AS source_attribute,
             sf.raw_attribute AS source_raw_attribute,
@@ -1408,6 +1829,7 @@ def _list_relationships(conn: sqlite3.Connection, fact_id: str) -> list[dict[str
         item["related_statement"] = (
             item["target_statement"] if item["direction"] == "outgoing" else item["source_statement"]
         )
+        _hydrate_relationship_payload(item)
         _decorate_relationship(item)
         results.append(item)
     return results
@@ -1423,8 +1845,121 @@ def _decorate_relationship(item: dict[str, Any]) -> dict[str, Any]:
         "CONTRADICTS": "Source -> Target",
         "RECONCILES": "Source -> Target",
         "TEMPORAL_SUCCESSOR": "Earlier -> Later",
+        "COMPUTED_SUPPORT": "Components -> Total",
+        "POTENTIAL_CONTRADICTION": "Source -> Target",
+        "UNRESOLVED_DIFFERENCE": "Source -> Target",
     }.get(rel_type, "Source -> Target")
     return item
+
+
+def _hydrate_relationship_payload(item: dict[str, Any]) -> dict[str, Any]:
+    item["supporting_fact_ids"] = _parse_id_list(item.get("supporting_fact_ids"))
+    item["supporting_evidence_ids"] = _parse_id_list(item.get("supporting_evidence_ids"))
+    item["computed_components"] = _parse_id_list(item.get("computed_components"))
+    return item
+
+
+def get_relationship(rel_id: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
+    rows = list_all_relationships(db_path)
+    for row in rows:
+        if str(row.get("id")) == str(rel_id):
+            return row
+    return None
+
+
+def relationship_type_counts(db_path: Path | str | None = None) -> dict[str, int]:
+    counts = {name: 0 for name in RELATIONSHIP_TYPES}
+    with get_connection(db_path) as conn:
+        if "fact_relationships" not in _table_names(conn):
+            return counts
+        rows = conn.execute(
+            "SELECT relationship_type, COUNT(*) AS n FROM fact_relationships GROUP BY relationship_type"
+        ).fetchall()
+        for row in rows:
+            counts[str(row["relationship_type"])] = int(row["n"] or 0)
+    return counts
+
+
+def rebuild_fact_clusters(db_path: Path | str | None = None) -> int:
+    from canonicalization_service import canonicalize_period, normalized_value_key
+
+    facts = search_facts(db_path=db_path)
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for fact in facts:
+        # Group by the same normalized identity relationship matching uses so hedged
+        # or differently-spelled equivalents ("Approximately 520" vs "520") co-cluster.
+        key = (
+            str(fact.get("canonical_attribute") or fact.get("attribute") or "").strip(),
+            normalized_value_key(
+                fact.get("canonical_value") or fact.get("value"), fact.get("unit")
+            ),
+            canonicalize_period(fact.get("period") or ""),
+        )
+        groups.setdefault(key, []).append(fact)
+    with get_connection(db_path) as conn:
+        conn.execute("DELETE FROM fact_clusters")
+        written = 0
+        for (attribute, _value_key, _period_key), members in groups.items():
+            representative = members[0]
+            value = str(
+                representative.get("canonical_value") or representative.get("value") or ""
+            ).strip()
+            period = str(representative.get("period") or "").strip()
+            fact_ids = [str(item["id"]) for item in members]
+            documents: set[str] = set()
+            evidence_n = 0
+            for fact_id in fact_ids:
+                docs = conn.execute(
+                    "SELECT source_document FROM fact_evidence WHERE fact_id = ?",
+                    (fact_id,),
+                ).fetchall()
+                evidence_n += len(docs)
+                documents.update(str(row["source_document"]) for row in docs)
+            conn.execute(
+                """
+                INSERT INTO fact_clusters (
+                    id, canonical_attribute, canonical_value, period,
+                    supporting_documents, supporting_fact_ids, document_count, evidence_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    attribute,
+                    value,
+                    period or None,
+                    json.dumps(sorted(documents), ensure_ascii=False),
+                    json.dumps(fact_ids, ensure_ascii=False),
+                    len(documents),
+                    evidence_n,
+                ),
+            )
+            written += 1
+        conn.commit()
+    return written
+
+
+def list_fact_clusters(db_path: Path | str | None = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as conn:
+        if "fact_clusters" not in _table_names(conn):
+            return []
+        rows = conn.execute(
+            """
+            SELECT id, canonical_attribute, canonical_value, period,
+                   supporting_documents, supporting_fact_ids, document_count, evidence_count
+            FROM fact_clusters
+            ORDER BY document_count DESC, canonical_attribute, period
+            """
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["supporting_documents"] = json.loads(item.get("supporting_documents") or "[]")
+            except json.JSONDecodeError:
+                item["supporting_documents"] = []
+            item["supporting_fact_ids"] = _parse_id_list(item.get("supporting_fact_ids"))
+            results.append(item)
+        return results
 
 
 def _refresh_fact_confidence(conn: sqlite3.Connection, fact_id: str) -> None:
@@ -1532,6 +2067,10 @@ def _normalize_relationship_type(value: Any) -> str | None:
         "SUCCESSOR": "TEMPORAL_SUCCESSOR",
         "DERIVED_FROM": "PART_OF",
         "EXPLANATORY": "SUPPORTS",
+        "COMPUTED": "COMPUTED_SUPPORT",
+        "ARITHMETIC": "COMPUTED_SUPPORT",
+        "UNRESOLVED": "UNRESOLVED_DIFFERENCE",
+        "POTENTIAL": "POTENTIAL_CONTRADICTION",
     }
     text = aliases.get(text, text)
     if text not in RELATIONSHIP_TYPES:

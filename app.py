@@ -27,7 +27,8 @@ st.set_page_config(page_title="Fact Knowledge Layer", layout="wide")
 st.title("Fact Knowledge Layer")
 st.caption(
     "Upload PDFs, extract generic entity–attribute–value facts with source evidence, "
-    "and search them in SQLite."
+    "and search raw fact instances in SQLite. Canonical clusters and relationship summaries "
+    "are on their own pages."
 )
 
 with st.sidebar:
@@ -104,10 +105,7 @@ if st.button("Extract facts", type="primary", disabled=not uploaded_files):
 
             records = [fact.to_record() for fact in document_facts]
             stored = insert_facts(records)
-            link_result = link_fact_relationships(
-                source_name,
-                llm=extractor.llm,
-            )
+            link_result = link_fact_relationships(llm=extractor.llm)
             total_facts += stored
             st.write(
                 f"Stored {stored} canonical facts from `{source_name}` "
@@ -146,7 +144,9 @@ else:
     display_columns = [
         "entity",
         "raw_attribute",
+        "canonical_entity",
         "canonical_attribute",
+        "canonical_value",
         "original_value",
         "attribute",
         "value",

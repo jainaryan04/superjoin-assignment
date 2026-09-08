@@ -7,6 +7,7 @@ from database import (
     delete_duplicate_relationships,
     init_db,
     list_all_relationships,
+    relationship_type_counts,
     search_facts,
     validate_relationships,
 )
@@ -21,6 +22,16 @@ st.set_page_config(page_title="Relationship debug", layout="wide")
 init_db()
 st.title("Relationship debug")
 st.caption("Inspect stored links and the last linking pass. Evidence is not shown here.")
+
+st.subheader("Relationship Summary")
+summary = relationship_type_counts()
+summary_cols = st.columns(6)
+for index, name in enumerate(
+    ["CORROBORATES", "CONTRADICTS", "RECONCILES", "PART_OF", "COMPUTED_SUPPORT", "POTENTIAL_CONTRADICTION"]
+):
+    summary_cols[index].metric(name.replace("_", " ").title(), summary.get(name, 0))
+if summary.get("UNRESOLVED_DIFFERENCE"):
+    st.caption(f"Unresolved differences: {summary['UNRESOLVED_DIFFERENCE']}")
 
 actions = st.columns(3)
 with actions[0]:
@@ -116,20 +127,37 @@ if records:
                     "Target Canonical Attribute": item.get("target_canonical_attribute")
                     or (item.get("target_fact_record") or {}).get("canonical_attribute")
                     or item.get("target_attribute"),
+                    "id": item.get("id"),
+                    "Candidate": item.get("source_fact") or item.get("source_statement"),
                     "Relationship": item.get("relationship_type"),
+                    "Confidence": item.get("confidence"),
+                    "Reasoning": item.get("validation_reason") or item.get("reasoning"),
                     "Accepted/Rejected": (
                         "Accepted" if item.get("validation_result") == "PASSED" else "Rejected"
                     ),
-                    "Reason": item.get("validation_reason") or item.get("reasoning"),
                 }
                 for item in records
             ]
         ),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Confidence": st.column_config.NumberColumn(format="%.2f"),
+        },
     )
 else:
     st.write("No relationship records.")
+
+if records:
+    picked = st.selectbox(
+        "Open relationship detail",
+        options=["—"] + [str(item.get("id")) for item in records],
+        format_func=lambda rel_id: "Select a relationship" if rel_id == "—" else rel_id[:8],
+    )
+    if picked and picked != "—" and st.button("Open relationship detail page"):
+        st.session_state["selected_relationship_id"] = picked
+        st.query_params["rel_id"] = picked
+        st.switch_page("pages/relationship_detail.py")
 
 st.subheader("Last linking pass")
 st.caption("Every proposed pair from the last rebuild, with accept/reject reasons.")
@@ -141,18 +169,22 @@ else:
         pd.DataFrame(
             [
                 {
-                    "Source": item.get("source_fact"),
+                    "Candidate": item.get("candidate") or item.get("source_fact"),
+                    "Relationship": item.get("proposed_relationship"),
+                    "Confidence": item.get("confidence"),
+                    "Reasoning": item.get("reason"),
+                    "Accepted/Rejected": "Accepted" if item.get("accepted") else "Rejected",
                     "Target": item.get("target_fact"),
                     "Source Canonical Attribute": item.get("source_canonical_attribute"),
                     "Target Canonical Attribute": item.get("target_canonical_attribute"),
-                    "Relationship": item.get("proposed_relationship"),
-                    "Accepted/Rejected": "Accepted" if item.get("accepted") else "Rejected",
-                    "Reason": item.get("reason"),
                 }
                 for item in candidates
             ]
         ),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Confidence": st.column_config.NumberColumn(format="%.2f"),
+        },
     )
     st.caption(f"{len(candidates)} candidate row(s).")

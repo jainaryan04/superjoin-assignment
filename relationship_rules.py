@@ -94,6 +94,25 @@ def same_entity(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return left_entity == right_entity
 
 
+def same_entity_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Entity identity for cross-fact reasoning.
+
+    Prefer the pre-canonicalization ``original_entity``; fall back to
+    ``canonical_entity`` (then ``entity``) only when it is unavailable.
+    CEO / employee_count facts all canonicalize to the same entity, so relying on
+    ``canonical_entity`` alone would link facts from different companies.
+    """
+
+    def key(fact: dict[str, Any]) -> str:
+        return normalize_text(
+            fact.get("original_entity")
+            or fact.get("canonical_entity")
+            or fact.get("entity")
+        )
+
+    return key(left) == key(right)
+
+
 def canonical_period(fact: dict[str, Any]) -> str:
     raw = " ".join(
         [
@@ -196,34 +215,232 @@ def is_sibling(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return bool(left_p and right_p and left_p != right_p)
 
 
+def same_period(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    a = normalize_text(left.get("period"))
+    b = normalize_text(right.get("period"))
+    return bool(a and b and a == b)
+
+
+def periods_differ(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    a = normalize_text(left.get("period"))
+    b = normalize_text(right.get("period"))
+    if not a and not b:
+        return True
+    if not a or not b:
+        return True
+    return a != b
+
+
+def values_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return normalized_value_key(
+        left.get("canonical_value") or left.get("value"), left.get("unit")
+    ) == normalized_value_key(
+        right.get("canonical_value") or right.get("value"), right.get("unit")
+    )
+
+
+def numeric_amount(fact: dict[str, Any]) -> tuple[float | None, str]:
+    key = normalized_value_key(fact.get("canonical_value") or fact.get("value"), fact.get("unit"))
+    amount_text, _, unit = key.partition("|")
+    try:
+        return float(amount_text), unit
+    except (TypeError, ValueError):
+        return None, unit
+
+
+def values_approximately_equivalent(
+    left: dict[str, Any], right: dict[str, Any], *, tolerance: float = 0.05
+) -> bool:
+    left_n, left_u = numeric_amount(left)
+    right_n, right_u = numeric_amount(right)
+    if left_n is None or right_n is None:
+        return False
+    if left_u and right_u and left_u != right_u:
+        return False
+    denom = max(abs(left_n), abs(right_n), 1e-9)
+    return abs(left_n - right_n) / denom <= tolerance
+
+
+def values_corroborate(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return values_equivalent(left, right) or values_approximately_equivalent(left, right)
+
+
+TRANSITION_RE = re.compile(
+    r"\b(resign(?:ed|ation)?|appoint(?:ed|ment)?|succeeded|replaced|took over|outgoing|incoming|formerly)\b",
+    re.IGNORECASE,
+)
+
+
+def _fact_texts(fact: dict[str, Any]) -> list[str]:
+    texts = [
+        str(fact.get("value") or ""),
+        str(fact.get("canonical_value") or ""),
+        str(fact.get("evidence_text") or ""),
+        str(fact.get("entity") or ""),
+    ]
+    for item in fact.get("evidence") or []:
+        texts.append(str(item.get("evidence_text") or ""))
+        texts.append(str(item.get("source_document") or ""))
+    return texts
+
+
+def find_transition_support(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    cohort: list[dict[str, Any]] | None = None,
+) -> dict[str, list[str]]:
+    """Return supporting fact/evidence IDs that mention a real transition."""
+    names = {
+        str(left.get("value") or "").strip().lower(),
+        str(right.get("value") or "").strip().lower(),
+    }
+    names.discard("")
+    fact_ids: list[str] = []
+    evidence_ids: list[str] = []
+    seen_facts: set[str] = set()
+    candidates = list(cohort or [])
+    for fact in (left, right):
+        if fact not in candidates:
+            candidates.append(fact)
+    for fact in candidates:
+        blob = " ".join(_fact_texts(fact)).lower()
+        if not TRANSITION_RE.search(blob):
+            continue
+        if names and not any(name and name in blob for name in names):
+            continue
+        fact_id = str(fact.get("id") or "")
+        if fact_id and fact_id not in seen_facts:
+            seen_facts.add(fact_id)
+            fact_ids.append(fact_id)
+        for item in fact.get("evidence") or []:
+            snippet = str(item.get("evidence_text") or "").lower()
+            if TRANSITION_RE.search(snippet) and item.get("id"):
+                evidence_ids.append(str(item["id"]))
+    return {"fact_ids": fact_ids, "evidence_ids": evidence_ids}
+
+
+def pair_evidence_ids(*facts: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for fact in facts:
+        for item in fact.get("evidence") or []:
+            if item.get("id"):
+                ids.append(str(item["id"]))
+    return ids
+
+
 def semantically_same_fact(left: dict[str, Any], right: dict[str, Any]) -> bool:
     if str(left.get("id") or "") and str(left.get("id") or "") == str(right.get("id") or ""):
         return True
-    if not same_entity(left, right):
-        return False
+    return False
+
+
+def classify_relationship(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    cohort: list[dict[str, Any]] | None = None,
+) -> str | None:
+    detail = classify_relationship_detail(left, right, cohort=cohort)
+    return None if detail is None else str(detail["relationship_type"])
+
+
+def classify_relationship_detail(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    cohort: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Return the relationship payload for a distinct fact pair, if any."""
+    if not left or not right:
+        return None
+    if str(left.get("id") or "") and str(left.get("id") or "") == str(right.get("id") or ""):
+        return None
     if fact_canonical_attribute(left) != fact_canonical_attribute(right):
-        return False
-    if normalized_value_key(left.get("value"), left.get("unit")) != normalized_value_key(
-        right.get("value"), right.get("unit")
-    ):
-        return False
-    return periods_mergeable(left.get("period"), right.get("period"))
+        return None
+    if not same_entity_identity(left, right):
+        return None
+    attr = fact_canonical_attribute(left)
+    support_ids = [str(left.get("id") or ""), str(right.get("id") or "")]
+    evidence_ids = pair_evidence_ids(left, right)
+    approx = values_approximately_equivalent(left, right) and not values_equivalent(left, right)
+    if values_corroborate(left, right):
+        reasoning = (
+            "Values are approximately equivalent within 5% tolerance."
+            if approx
+            else "Same canonical attribute and normalized value."
+        )
+        return {
+            "relationship_type": "CORROBORATES",
+            "reasoning": reasoning,
+            "supporting_fact_ids": support_ids,
+            "supporting_evidence_ids": evidence_ids,
+            "confidence": 0.84 if approx else 0.9,
+        }
+    if same_period(left, right):
+        return {
+            "relationship_type": "CONTRADICTS",
+            "reasoning": "Same canonical attribute and period but different normalized values.",
+            "supporting_fact_ids": support_ids,
+            "supporting_evidence_ids": evidence_ids,
+            "confidence": 0.9,
+        }
+    support = find_transition_support(left, right, cohort)
+    if support["fact_ids"]:
+        cited = ", ".join(f"#{item}" for item in support["fact_ids"])
+        return {
+            "relationship_type": "RECONCILES",
+            "reasoning": f"Supported by resignation/appointment fact {cited}.",
+            "supporting_fact_ids": support["fact_ids"],
+            "supporting_evidence_ids": support["evidence_ids"] or evidence_ids,
+            "confidence": 0.86,
+        }
+    rel_type = (
+        "POTENTIAL_CONTRADICTION"
+        if attr == "holder"
+        else "UNRESOLVED_DIFFERENCE"
+    )
+    return {
+        "relationship_type": rel_type,
+        "reasoning": (
+            "Different values for the same canonical attribute without extracted transition evidence."
+        ),
+        "supporting_fact_ids": support_ids,
+        "supporting_evidence_ids": evidence_ids,
+        "confidence": 0.7,
+    }
+
+
+def relationship_explanation(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    rel_type: str,
+    cohort: list[dict[str, Any]] | None = None,
+) -> str:
+    detail = classify_relationship_detail(left, right, cohort=cohort)
+    if detail and detail.get("relationship_type") == rel_type:
+        return str(detail.get("reasoning") or "")
+    if rel_type == "CORROBORATES":
+        return "Same canonical attribute and normalized value."
+    if rel_type == "CONTRADICTS":
+        return "Same canonical attribute and period but different normalized values."
+    if rel_type == "RECONCILES":
+        return "Supported by extracted transition evidence."
+    if rel_type == "COMPUTED_SUPPORT":
+        return "Component values sum to the total."
+    return ""
 
 
 def allowed_relationship_types(candidate: dict[str, Any], parent: dict[str, Any]) -> list[str]:
-    """PART_OF and CONTRADICTS are evaluated independently."""
+    """PART_OF, CORROBORATES, CONTRADICTS, and RECONCILES are evaluated independently."""
     if candidate.get("id") is not None and parent.get("id") is not None:
         if str(candidate.get("id")) == str(parent.get("id")):
             return []
-    if semantically_same_fact(candidate, parent):
-        return []
 
     allowed: list[str] = []
     if _part_of_pair_eligible(candidate, parent):
         allowed.append("PART_OF")
 
-    if _contradiction_pair_eligible(candidate, parent):
-        allowed.extend(["CONTRADICTS", "CORROBORATES", "RECONCILES"])
+    classified = classify_relationship(candidate, parent)
+    if classified:
+        allowed.append(classified)
 
     return sorted(set(allowed))
 
@@ -235,15 +452,7 @@ def _part_of_pair_eligible(candidate: dict[str, Any], parent: dict[str, Any]) ->
 
 
 def _contradiction_pair_eligible(candidate: dict[str, Any], parent: dict[str, Any]) -> bool:
-    if not same_entity(candidate, parent):
-        return False
-    if not periods_compatible(candidate, parent):
-        return False
-    if fact_canonical_attribute(candidate) != fact_canonical_attribute(parent):
-        return False
-    if not same_scope(candidate, parent):
-        return False
-    return True
+    return classify_relationship(candidate, parent) == "CONTRADICTS"
 
 
 def filter_relationship_candidates(
@@ -258,11 +467,14 @@ def filter_relationship_candidates(
         if allowed:
             plausible.append({"candidate": candidate, "allowed_types": allowed})
             continue
+        proposed = _proposed_type(candidate, parent)
+        if proposed not in {"PART_OF"}:
+            continue
         rejected.append(
             _rejection_row(
                 candidate,
                 parent,
-                _proposed_type(candidate, parent),
+                proposed,
                 _reject_reason(candidate, parent),
             )
         )
@@ -270,28 +482,29 @@ def filter_relationship_candidates(
 
 
 def _proposed_type(candidate: dict[str, Any], parent: dict[str, Any]) -> str:
+    classified = classify_relationship(candidate, parent)
+    if classified:
+        return classified
     if is_sibling(candidate, parent):
         return "PART_OF"
     if is_hierarchical_child(candidate, parent) or is_hierarchical_child(parent, candidate):
         return "PART_OF"
     if fact_canonical_attribute(candidate) != fact_canonical_attribute(parent):
-        return "CONTRADICTS"
+        return "UNKNOWN"
     return "UNKNOWN"
 
 
 def _reject_reason(candidate: dict[str, Any], parent: dict[str, Any]) -> str:
     if is_sibling(candidate, parent):
         return "Sibling facts cannot be PART_OF each other."
-    if not same_entity(candidate, parent) and not is_hierarchical_child(candidate, parent):
-        if fact_canonical_attribute(candidate) == fact_canonical_attribute(parent):
-            return "Entities differ."
     if is_hierarchical_child(parent, candidate):
         return "Parent cannot be PART_OF its child."
     if fact_canonical_attribute(candidate) != fact_canonical_attribute(parent):
         if not is_hierarchical_child(candidate, parent):
             return "attribute mismatch"
-    if not periods_compatible(candidate, parent):
-        return "Periods are incompatible."
+    classified = classify_relationship(candidate, parent)
+    if classified is None and fact_canonical_attribute(candidate) == fact_canonical_attribute(parent):
+        return "Pair does not corroborate, contradict, or reconcile."
     return "Candidate pair is not eligible."
 
 

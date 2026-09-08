@@ -30,6 +30,11 @@ PAGE_TEXT = (
 )
 
 
+def _part_of_count(fact: dict) -> int:
+    """PART_OF links touching a fact. COMPUTED_SUPPORT is a separate, expected type."""
+    return len([r for r in fact.get("relationships") or [] if r["relationship_type"] == "PART_OF"])
+
+
 def _sample_facts() -> list[dict]:
     return [
         {
@@ -85,8 +90,82 @@ class CanonicalizationTests(unittest.TestCase):
         self.assertEqual(fact["raw_attribute"], "fiscal_year")
         self.assertEqual(fact["canonical_attribute"], "total_revenue")
         self.assertEqual(fact["period"], "FY2024")
-        self.assertEqual(fact["canonical_value"], "₹120 crore")
+        self.assertEqual(fact["canonical_value"], "120 INR crore")
+        self.assertEqual(fact["value"], "₹120 crore")
         self.assertEqual(fact["unit"], "crore")
+
+    def test_normalizes_currency_dates_and_addresses(self) -> None:
+        money = canonicalize_fact(
+            {
+                "entity": "Acme",
+                "attribute": "total_revenue",
+                "value": "Rs. 1,200 million",
+                "period": "FY2024",
+            }
+        )
+        date = canonicalize_fact(
+            {
+                "entity": "Acme",
+                "attribute": "incorporation_date",
+                "value": "15 March 2024",
+            }
+        )
+        address = canonicalize_fact(
+            {
+                "entity": "Acme",
+                "attribute": "registered_address",
+                "value": "221B Baker St., London",
+            }
+        )
+        self.assertEqual(money["canonical_value"], "1200 INR million")
+        self.assertEqual(money["value"], "Rs. 1,200 million")
+        self.assertEqual(date["canonical_value"], "2024-03-15")
+        self.assertEqual(date["value"], "15 March 2024")
+        self.assertEqual(address["canonical_value"], "221b baker street, london")
+        self.assertEqual(address["value"], "221B Baker St., London")
+
+    def test_employee_and_ceo_entity_resolution(self) -> None:
+        headcount = canonicalize_fact(
+            {"entity": "Company", "attribute": "Headcount", "value": "500"}
+        )
+        employees = canonicalize_fact(
+            {"entity": "Employees", "attribute": "Employee Count", "value": "520"}
+        )
+        ceo = canonicalize_fact(
+            {"entity": "Company", "attribute": "CEO", "value": "Rohit Sharma"}
+        )
+        incoming = canonicalize_fact(
+            {
+                "entity": "Priya Mehta | position=CEO",
+                "attribute": "role",
+                "value": "CEO",
+            }
+        )
+        approx = canonicalize_fact(
+            {"entity": "Company", "attribute": "Employee Count", "value": "Approximately 500"}
+        )
+        software = canonicalize_fact(
+            {
+                "entity": "Company",
+                "attribute": "Software Products",
+                "value": "₹90 crore",
+                "period": "FY2024",
+            }
+        )
+        self.assertEqual(headcount["canonical_attribute"], "employee_count")
+        self.assertEqual(employees["canonical_attribute"], "employee_count")
+        self.assertEqual(ceo["canonical_entity"], "CEO")
+        self.assertEqual(ceo["canonical_attribute"], "holder")
+        self.assertEqual(ceo["value"], "Rohit Sharma")
+        self.assertEqual(incoming["canonical_attribute"], "holder")
+        self.assertEqual(incoming["value"], "Priya Mehta")
+        from canonicalization_service import normalized_value_key
+
+        self.assertEqual(
+            normalized_value_key(approx["value"], approx.get("unit")),
+            normalized_value_key("500"),
+        )
+        self.assertEqual(software["canonical_attribute"], "product_revenue")
 
     def test_page_context_does_not_create_synthetic_services_total(self) -> None:
         fact = canonicalize_fact(
@@ -152,7 +231,10 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
         part_of = [row for row in rels if row["relationship_type"] == "PART_OF"]
         contradicts = [row for row in rels if row["relationship_type"] == "CONTRADICTS"]
         self.assertEqual(len(part_of), 2, part_of)
-        self.assertEqual(result["relationships_added"], 2)
+        self.assertEqual(result["relationships_added"], len(rels))
+        self.assertLessEqual(
+            {row["relationship_type"] for row in rels}, {"PART_OF", "COMPUTED_SUPPORT"}
+        )
         self.assertEqual(contradicts, [])
 
         pairs = {
@@ -177,9 +259,9 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
         total = get_fact(by_attr["total_revenue"]["id"], self.db_path)
         product = get_fact(by_attr["product_revenue"]["id"], self.db_path)
         services = get_fact(by_attr["services_revenue"]["id"], self.db_path)
-        self.assertEqual(total["relationship_count"], 2)
-        self.assertEqual(product["relationship_count"], 1)
-        self.assertEqual(services["relationship_count"], 1)
+        self.assertEqual(_part_of_count(total), 2)
+        self.assertEqual(_part_of_count(product), 1)
+        self.assertEqual(_part_of_count(services), 1)
         self.assertEqual(total["evidence_count"], 1)
         self.assertEqual(total["evidence"][0]["evidence_text"], PAGE_TEXT)
 
@@ -209,11 +291,14 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
         self.assertEqual(len(search_facts(db_path=self.db_path)), 3)
 
         rels = list_all_relationships(self.db_path)
-        self.assertEqual(len(rels), 2)
-        self.assertEqual({row["relationship_type"] for row in rels}, {"PART_OF"})
+        part_of = [row for row in rels if row["relationship_type"] == "PART_OF"]
+        self.assertEqual(len(part_of), 2)
+        self.assertLessEqual(
+            {row["relationship_type"] for row in rels}, {"PART_OF", "COMPUTED_SUPPORT"}
+        )
         pairs = {
             (row["source_canonical_attribute"], row["target_canonical_attribute"])
-            for row in rels
+            for row in part_of
         }
         self.assertEqual(
             pairs,
@@ -237,17 +322,18 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
         first = link_fact_relationships("demo.pdf", db_path=self.db_path)
         second = link_fact_relationships("demo.pdf", db_path=self.db_path)
         rels = list_all_relationships(self.db_path)
-        self.assertEqual(len(rels), 2)
-        self.assertEqual(first["final_relationships_stored"], 2)
-        self.assertEqual(second["final_relationships_stored"], 2)
+        part_of = [row for row in rels if row["relationship_type"] == "PART_OF"]
+        self.assertEqual(len(part_of), 2)
+        self.assertEqual(first["final_relationships_stored"], len(rels))
+        self.assertEqual(second["final_relationships_stored"], len(rels))
         self.assertGreaterEqual(second["duplicate_relationships_removed"], 1)
         self.assertEqual(second["self_relationships_removed"], 0)
         types = {row["relationship_type"] for row in rels}
-        self.assertEqual(types, {"PART_OF"})
+        self.assertLessEqual(types, {"PART_OF", "COMPUTED_SUPPORT"})
         self.assertNotIn("CORROBORATES", types)
         keys = {
             (row["source_fact_id"], row["target_fact_id"], row["relationship_type"])
-            for row in rels
+            for row in part_of
         }
         self.assertEqual(len(keys), 2)
         self.assertEqual(find_self_links(self.db_path), [])
@@ -279,7 +365,10 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
                 self.db_path,
             )
         )
-        self.assertEqual(len(list_all_relationships(self.db_path)), 2)
+        self.assertEqual(
+            len([r for r in list_all_relationships(self.db_path) if r["relationship_type"] == "PART_OF"]),
+            2,
+        )
         for rel_type in ("CORROBORATES", "CONTRADICTS", "PART_OF", "RECONCILES", "SUPPORTS"):
             check = validate_relationship(total, total, rel_type, cohort=[total])
             self.assertFalse(check["ok"], rel_type)
@@ -310,9 +399,12 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
             conn.commit()
         rebuilt = rebuild_relationships(db_path=self.db_path)
         rels = list_all_relationships(self.db_path)
-        self.assertEqual(rebuilt["final_relationships_stored"], 2)
-        self.assertEqual(len(rels), 2)
-        self.assertEqual({row["relationship_type"] for row in rels}, {"PART_OF"})
+        part_of = [row for row in rels if row["relationship_type"] == "PART_OF"]
+        self.assertEqual(rebuilt["final_relationships_stored"], len(rels))
+        self.assertEqual(len(part_of), 2)
+        self.assertLessEqual(
+            {row["relationship_type"] for row in rels}, {"PART_OF", "COMPUTED_SUPPORT"}
+        )
         self.assertEqual(find_self_links(self.db_path), [])
         self.assertNotIn("CORROBORATES", {row["relationship_type"] for row in rels})
 
@@ -346,13 +438,16 @@ class RevenueHierarchyDatasetTests(unittest.TestCase):
 
         result = link_fact_relationships("demo.pdf", db_path=self.db_path)
         rels = list_all_relationships(self.db_path)
-        self.assertEqual(len(rels), 2, rels)
-        self.assertEqual(result["final_relationships_stored"], 2)
-        self.assertEqual({row["relationship_type"] for row in rels}, {"PART_OF"})
+        part_of = [row for row in rels if row["relationship_type"] == "PART_OF"]
+        self.assertEqual(len(part_of), 2, rels)
+        self.assertEqual(result["final_relationships_stored"], len(rels))
+        self.assertLessEqual(
+            {row["relationship_type"] for row in rels}, {"PART_OF", "COMPUTED_SUPPORT"}
+        )
         self.assertEqual(find_self_links(self.db_path), [])
         pairs = {
             (row["source_canonical_attribute"], row["target_canonical_attribute"])
-            for row in rels
+            for row in part_of
         }
         self.assertEqual(
             pairs,
