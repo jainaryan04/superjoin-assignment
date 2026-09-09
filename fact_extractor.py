@@ -172,18 +172,51 @@ class FactExtractor:
         return facts
 
 
+def _from_streamlit_secrets(name: str) -> str | None:
+    """Read a setting from st.secrets when running on Streamlit Cloud.
+
+    Streamlit Cloud stores deployment secrets in st.secrets, and only exports
+    *top-level* keys as environment variables — so a key placed under a
+    ``[section]`` in the Secrets editor is invisible to ``os.getenv``. This
+    checks both shapes. Import is lazy and guarded so nothing here depends on
+    Streamlit (tests, CLI, and ``migrate.py`` never import it).
+    """
+    try:
+        import streamlit as st  # noqa: PLC0415
+
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+        for section in ("openai", "llm", "general", "env"):
+            block = st.secrets.get(section)
+            if block and block.get(name):
+                return str(block[name])
+    except Exception:
+        return None
+    return None
+
+
+def _setting(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name) or _from_streamlit_secrets(name)
+        if value:
+            return value
+    return None
+
+
 def client_from_settings(
     api_key: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
 ) -> OpenAICompatibleClient:
-    key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+    key = api_key or _setting("OPENAI_API_KEY", "LLM_API_KEY")
     if not key:
         raise ValueError(
-            "Missing API key. Set OPENAI_API_KEY or enter it in the sidebar."
+            "Missing API key. Set OPENAI_API_KEY (env, .env, or Streamlit "
+            "secrets) or enter it in the sidebar."
         )
-    resolved_model = model or os.getenv("OPENAI_MODEL") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
-    resolved_base = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
+    resolved_model = model or _setting("OPENAI_MODEL", "LLM_MODEL") or "gpt-4o-mini"
+    resolved_base = base_url or _setting("OPENAI_BASE_URL", "LLM_BASE_URL")
     return OpenAICompatibleClient(
         api_key=key,
         model=resolved_model,

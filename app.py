@@ -21,6 +21,28 @@ from provenance_service import link_fact_relationships
 from fact_details import render_fact_details
 
 load_dotenv()
+
+# On Streamlit Cloud the API key lives in st.secrets. Mirror the known settings
+# into the environment so os.getenv (used across the app) sees them, and so a
+# key added under a [section] in the Secrets editor still works.
+try:
+    for _name in (
+        "OPENAI_API_KEY", "LLM_API_KEY",
+        "OPENAI_MODEL", "LLM_MODEL",
+        "OPENAI_BASE_URL", "LLM_BASE_URL",
+    ):
+        _val = st.secrets.get(_name)
+        if not _val:
+            for _section in ("openai", "llm", "general", "env"):
+                _block = st.secrets.get(_section)
+                if _block and _block.get(_name):
+                    _val = _block[_name]
+                    break
+        if _val and not os.getenv(_name):
+            os.environ[_name] = str(_val)
+except Exception:
+    pass
+
 init_db()
 
 st.set_page_config(page_title="Fact Knowledge Layer", layout="wide")
