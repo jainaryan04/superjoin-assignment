@@ -14,7 +14,7 @@ from fact_extractor import client_from_settings
 from provenance_service import debug_rows, link_fact_relationships
 from fact_details import render_fact_details
 
-st.set_page_config(page_title="Provenance debug", layout="wide")
+st.set_page_config(page_title="Provenance Debug", layout="wide")
 init_db()
 st.title("Provenance debug")
 st.caption("Evidence is source text. Relationships are connections between facts.")
@@ -70,7 +70,7 @@ overview = pd.DataFrame(
 )
 st.subheader("Facts")
 event = st.dataframe(
-    overview[["Fact", "Evidence Count", "Relationship Count", "id"]],
+    overview[["Fact", "Evidence Count", "Relationship Count"]],
     use_container_width=True,
     hide_index=True,
     on_select="rerun",

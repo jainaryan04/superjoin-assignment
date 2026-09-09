@@ -4,5 +4,5 @@ import streamlit as st
 
 from fact_details import render
 
-st.set_page_config(page_title="Fact detail", layout="wide")
+st.set_page_config(page_title="Fact Detail", layout="wide")
 render()

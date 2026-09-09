@@ -5,7 +5,7 @@ import streamlit as st
 
 from database import init_db, list_fact_clusters, rebuild_fact_clusters, search_facts
 
-st.set_page_config(page_title="Canonical Fact Clusters", layout="wide")
+st.set_page_config(page_title="Fact Clusters", layout="wide")
 init_db()
 st.title("Canonical Fact Clusters")
 st.caption(

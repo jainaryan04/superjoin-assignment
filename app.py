@@ -26,9 +26,8 @@ init_db()
 st.set_page_config(page_title="Fact Knowledge Layer", layout="wide")
 st.title("Fact Knowledge Layer")
 st.caption(
-    "Upload PDFs, extract generic entity–attribute–value facts with source evidence, "
-    "and search raw fact instances in SQLite. Canonical clusters and relationship summaries "
-    "are on their own pages."
+    "Upload PDFs to extract entity–attribute–value facts, each grounded in a source snippet. "
+    "Use the pages in the sidebar for canonical clusters, similar facts and relationships."
 )
 
 with st.sidebar:
@@ -119,7 +118,6 @@ if st.button("Extract facts", type="primary", disabled=not uploaded_files):
 
 st.divider()
 st.subheader("Facts")
-st.caption("Select a row to inspect evidence text and related facts.")
 
 documents = list_source_documents()
 filter_cols = st.columns([2, 1])
@@ -131,8 +129,40 @@ with filter_cols[1]:
         options=["All documents"] + documents,
     )
 
+show_raw = st.toggle(
+    "Show canonical & raw columns",
+    value=False,
+    help="Adds the pre-normalisation entity/attribute/value alongside the canonical form.",
+)
+
 source_filter = None if selected_document == "All documents" else selected_document
 rows = search_facts(query=query, source_document=source_filter)
+
+# One friendly header per column; the same map also drives which columns show.
+COLUMN_CONFIG = {
+    "entity": st.column_config.TextColumn("Entity"),
+    "attribute": st.column_config.TextColumn("Attribute"),
+    "value": st.column_config.TextColumn("Value"),
+    "unit": st.column_config.TextColumn("Unit"),
+    "period": st.column_config.TextColumn("Period"),
+    "confidence": st.column_config.NumberColumn("Confidence", format="%.2f"),
+    "document_count": st.column_config.NumberColumn("Docs", format="%d"),
+    "evidence_count": st.column_config.NumberColumn("Evidence", format="%d"),
+    "relationship_count": st.column_config.NumberColumn("Links", format="%d"),
+    "source_document": st.column_config.TextColumn("Primary source"),
+    "page_number": st.column_config.NumberColumn("Page", format="%d"),
+    "evidence_text": st.column_config.TextColumn("Evidence snippet", width="large"),
+    "canonical_entity": st.column_config.TextColumn("Canonical entity"),
+    "raw_attribute": st.column_config.TextColumn("Raw attribute"),
+    "canonical_value": st.column_config.TextColumn("Canonical value"),
+    "original_value": st.column_config.TextColumn("Original value"),
+}
+CORE_COLUMNS = [
+    "entity", "attribute", "value", "unit", "period", "confidence",
+    "document_count", "evidence_count", "relationship_count",
+    "source_document", "page_number", "evidence_text",
+]
+RAW_COLUMNS = ["canonical_entity", "raw_attribute", "canonical_value", "original_value"]
 
 if not rows:
     st.info("No facts yet. Upload PDFs and run extraction.")
@@ -141,26 +171,8 @@ else:
         st.session_state["facts_table_nonce"] = st.session_state.get("facts_table_nonce", 0) + 1
 
     frame = pd.DataFrame(rows)
-    display_columns = [
-        "entity",
-        "raw_attribute",
-        "canonical_entity",
-        "canonical_attribute",
-        "canonical_value",
-        "original_value",
-        "attribute",
-        "value",
-        "unit",
-        "period",
-        "confidence",
-        "document_count",
-        "evidence_count",
-        "relationship_count",
-        "source_document",
-        "page_number",
-        "evidence_text",
-        "id",
-    ]
+    display_columns = CORE_COLUMNS + (RAW_COLUMNS if show_raw else [])
+    display_columns = [column for column in display_columns if column in frame.columns]
     event = st.dataframe(
         frame[display_columns],
         use_container_width=True,
@@ -168,18 +180,11 @@ else:
         on_select="rerun",
         selection_mode="single-row",
         key=f"facts_table_{st.session_state.get('facts_table_nonce', 0)}",
-        column_config={
-            "confidence": st.column_config.NumberColumn(format="%.2f"),
-            "page_number": st.column_config.NumberColumn(format="%d"),
-            "document_count": st.column_config.NumberColumn("documents", format="%d"),
-            "evidence_count": st.column_config.NumberColumn("evidence", format="%d"),
-            "relationship_count": st.column_config.NumberColumn("relationships", format="%d"),
-            "evidence_text": st.column_config.TextColumn(width="large"),
-        },
+        column_config=COLUMN_CONFIG,
     )
     st.caption(
-        f"{len(rows)} fact(s) shown. Evidence count is the number of source snippets, "
-        "not related facts. Select a row to open Fact Details."
+        f"{len(rows)} fact(s). *Evidence* counts source snippets, *Links* counts related facts. "
+        "Select a row to see its evidence and relationships."
     )
 
     selected_rows = event.selection.rows if event.selection else []
@@ -192,4 +197,4 @@ else:
             st.divider()
             render_fact_details(fact)
             if st.button("Open full fact detail page"):
-                st.switch_page("pages/fact_detail.py")
+                st.switch_page("pages/7_Fact_Detail.py")

@@ -4,7 +4,7 @@ import streamlit as st
 
 from database import get_fact, get_relationship, init_db, list_all_relationships
 
-st.set_page_config(page_title="Relationship detail", layout="wide")
+st.set_page_config(page_title="Relationship Detail", layout="wide")
 init_db()
 st.title("Relationship Detail")
 

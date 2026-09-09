@@ -18,7 +18,7 @@ from provenance_service import (
     rebuild_relationships,
 )
 
-st.set_page_config(page_title="Relationship debug", layout="wide")
+st.set_page_config(page_title="Relationship Debug", layout="wide")
 init_db()
 st.title("Relationship debug")
 st.caption("Inspect stored links and the last linking pass. Evidence is not shown here.")
@@ -71,8 +71,8 @@ overview = pd.DataFrame(
     [
         {
             "Fact": f"{row.get('canonical_attribute') or row['attribute']} = {row['value']}",
-            "Raw Attribute": row.get("raw_attribute") or "",
-            "Canonical Attribute": row.get("canonical_attribute") or row.get("attribute") or "",
+            "Entity": row.get("entity") or "",
+            "Period": row.get("period") or "",
             "Relationship Count": row["relationship_count"],
             "id": row["id"],
         }
@@ -85,7 +85,7 @@ if overview.empty:
 
 st.subheader("Facts")
 event = st.dataframe(
-    overview,
+    overview[["Fact", "Entity", "Period", "Relationship Count"]],
     use_container_width=True,
     hide_index=True,
     on_select="rerun",
@@ -157,7 +157,7 @@ if records:
     if picked and picked != "—" and st.button("Open relationship detail page"):
         st.session_state["selected_relationship_id"] = picked
         st.query_params["rel_id"] = picked
-        st.switch_page("pages/relationship_detail.py")
+        st.switch_page("pages/6_Relationship_Detail.py")
 
 st.subheader("Last linking pass")
 st.caption("Every proposed pair from the last rebuild, with accept/reject reasons.")
