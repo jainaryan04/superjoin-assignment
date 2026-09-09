@@ -6,10 +6,12 @@ import re
 from typing import Any
 
 from canonicalization_service import (
+    dimensions_compatible,
     infer_canonical_attribute,
     normalized_value_key,
     periods_mergeable,
     revenue_children,
+    value_dimension,
 )
 
 PERIOD_RE = re.compile(
@@ -261,6 +263,26 @@ def values_approximately_equivalent(
     return abs(left_n - right_n) / denom <= tolerance
 
 
+def fact_dimension(fact: dict[str, Any]) -> str:
+    return value_dimension(
+        fact.get("canonical_value") or fact.get("value"), fact.get("unit")
+    )
+
+
+def values_comparable(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Two facts are comparable only when their value dimensions line up.
+
+    A money figure and a percentage are not in disagreement; they measure
+    different things, so they must not produce CORROBORATES or CONTRADICTS.
+    """
+    return dimensions_compatible(
+        left.get("canonical_value") or left.get("value"),
+        left.get("unit"),
+        right.get("canonical_value") or right.get("value"),
+        right.get("unit"),
+    )
+
+
 def values_corroborate(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return values_equivalent(left, right) or values_approximately_equivalent(left, right)
 
@@ -284,6 +306,47 @@ def _fact_texts(fact: dict[str, Any]) -> list[str]:
     return texts
 
 
+def _fact_blob(fact: dict[str, Any]) -> str:
+    """Lower-cased searchable text for a fact, memoised on the dict."""
+    blob = fact.get("_text_blob")
+    if blob is None:
+        blob = " ".join(_fact_texts(fact)).lower()
+        fact["_text_blob"] = blob
+    return blob
+
+
+def _fact_mentions_transition(fact: dict[str, Any]) -> bool:
+    return bool(TRANSITION_RE.search(_fact_blob(fact)))
+
+
+# Keyed by id() of the cohort list. link_fact_relationships holds one cohort for
+# a whole run and calls reset_relationship_caches() before it starts, so this
+# never serves a stale list.
+_TRANSITION_CACHE: dict[int, tuple[int, list[dict[str, Any]]]] = {}
+
+
+def reset_relationship_caches() -> None:
+    _TRANSITION_CACHE.clear()
+
+
+def transition_candidates(cohort: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Facts in the cohort whose text mentions a transition, computed once.
+
+    Non-matching facts contribute nothing to ``find_transition_support`` (they
+    are skipped immediately), so pre-filtering turns a full O(N) cohort scan per
+    pair into an O(k) scan over the handful of transition facts.
+    """
+    if not cohort:
+        return []
+    key = id(cohort)
+    cached = _TRANSITION_CACHE.get(key)
+    if cached is not None and cached[0] == len(cohort):
+        return cached[1]
+    matches = [fact for fact in cohort if _fact_mentions_transition(fact)]
+    _TRANSITION_CACHE[key] = (len(cohort), matches)
+    return matches
+
+
 def find_transition_support(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -298,12 +361,13 @@ def find_transition_support(
     fact_ids: list[str] = []
     evidence_ids: list[str] = []
     seen_facts: set[str] = set()
-    candidates = list(cohort or [])
+    candidates = list(transition_candidates(cohort))
+    seen_ids = {id(fact) for fact in candidates}
     for fact in (left, right):
-        if fact not in candidates:
+        if id(fact) not in seen_ids:
             candidates.append(fact)
     for fact in candidates:
-        blob = " ".join(_fact_texts(fact)).lower()
+        blob = _fact_blob(fact)
         if not TRANSITION_RE.search(blob):
             continue
         if names and not any(name and name in blob for name in names):
@@ -356,6 +420,8 @@ def classify_relationship_detail(
     if fact_canonical_attribute(left) != fact_canonical_attribute(right):
         return None
     if not same_entity_identity(left, right):
+        return None
+    if not values_comparable(left, right):
         return None
     attr = fact_canonical_attribute(left)
     support_ids = [str(left.get("id") or ""), str(right.get("id") or "")]

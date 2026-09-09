@@ -1,0 +1,20 @@
+AFTER
+=====
+facts                                  1821
+evidence                               2221
+relationships                          2150
+clusters                               1730
+embeddings                             1821
+contradictions                         201
+employee_count_facts                   78
+employee_count_invalid                 0
+revenue_facts                          235
+revenue_facts_with_ratio_value         0
+currency_anomalies                     0
+dimensional_mismatch_relationships     0
+dim_strictly_different_relationships   26
+mixed_dimension_attributes             2
+distinct_canonical_attributes          634
+facts_missing_evidence                 0
+facts_missing_embedding                0
+relationships_by_type                  {'COMPUTED_SUPPORT': 5, 'CONTRADICTS': 201, 'CORROBORATES': 88, 'PART_OF': 1210, 'POTENTIAL_CONTRADICTION': 5, 'RECONCILES': 32, 'UNRESOLVED_DIFFERENCE': 609}

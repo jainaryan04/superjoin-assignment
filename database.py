@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from canonicalization_service import normalize_token
+
 DB_PATH = Path("data") / "facts.db"
 
 EVIDENCE_TYPES = ("DIRECT", "SUPPORTING")
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS facts (
     canonical_attribute TEXT,
     canonical_entity TEXT,
     canonical_value TEXT,
+    currency TEXT,
     original_entity TEXT,
     original_attribute TEXT,
     original_value TEXT,
@@ -202,6 +205,7 @@ CANONICAL_FACT_COLUMNS = {
     "canonical_attribute": "TEXT",
     "canonical_entity": "TEXT",
     "canonical_value": "TEXT",
+    "currency": "TEXT",
     "original_entity": "TEXT",
     "original_attribute": "TEXT",
     "original_value": "TEXT",
@@ -351,6 +355,7 @@ def reprocess_fact_canonicalization(conn: sqlite3.Connection) -> int:
                 canonical_attribute = ?,
                 canonical_entity = ?,
                 canonical_value = ?,
+                currency = ?,
                 original_entity = ?,
                 original_attribute = ?,
                 original_value = ?,
@@ -367,6 +372,7 @@ def reprocess_fact_canonicalization(conn: sqlite3.Connection) -> int:
                 prepared["canonical_attribute"],
                 prepared.get("canonical_entity"),
                 prepared.get("canonical_value") or original_value,
+                prepared.get("currency"),
                 original_entity,
                 original_attribute,
                 original_value,
@@ -756,6 +762,41 @@ def insert_relationship(item: dict[str, Any], db_path: Path | str | None = None)
         inserted = _insert_relationship(conn, item)
         conn.commit()
         return inserted
+
+
+def insert_relationships_bulk(
+    items: list[dict[str, Any]], db_path: Path | str | None = None
+) -> list[bool]:
+    """Insert many relationships in one transaction (one commit, one connection).
+
+    Returns the per-item insert result in order. Used by the relationship
+    rebuild so a full-corpus link is not thousands of single-row commits.
+    """
+    results: list[bool] = []
+    with get_connection(db_path) as conn:
+        for item in items:
+            source_id = str(item.get("source_fact_id") or "")
+            target_id = str(item.get("target_fact_id") or "")
+            if not source_id or not target_id or source_id == target_id:
+                results.append(False)
+                continue
+            results.append(_insert_relationship(conn, item))
+        conn.commit()
+    return results
+
+
+def existing_relationship_keys(db_path: Path | str | None = None) -> set[tuple[str, str, str]]:
+    """Every stored relationship as (relationship_type, pair_low, pair_high)."""
+    with get_connection(db_path) as conn:
+        if "fact_relationships" not in _table_names(conn):
+            return set()
+        rows = conn.execute(
+            "SELECT relationship_type, pair_low, pair_high FROM fact_relationships"
+        ).fetchall()
+    return {
+        (str(r["relationship_type"] or ""), str(r["pair_low"] or ""), str(r["pair_high"] or ""))
+        for r in rows
+    }
 
 
 def relationship_exists(
@@ -1545,10 +1586,10 @@ def _upsert_fact(conn: sqlite3.Connection, fact: dict[str, Any]) -> str:
         """
         INSERT INTO facts (
             id, identity_key, entity, attribute, raw_attribute,
-            canonical_attribute, canonical_entity, canonical_value,
+            canonical_attribute, canonical_entity, canonical_value, currency,
             original_entity, original_attribute, original_value, original_period,
             value, unit, period, confidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fact_id,
@@ -1559,6 +1600,7 @@ def _upsert_fact(conn: sqlite3.Connection, fact: dict[str, Any]) -> str:
             canonical_attribute,
             fact.get("canonical_entity") or fact["entity"],
             fact.get("canonical_value") or fact["value"],
+            fact.get("currency"),
             fact.get("original_entity") or fact["entity"],
             fact.get("original_attribute") or fact.get("raw_attribute") or fact["attribute"],
             fact.get("original_value") or fact["value"],
@@ -2116,4 +2158,11 @@ def _dot_label(text: str, limit: int = 64) -> str:
 
 
 def _norm(value: str) -> str:
-    return " ".join(value.strip().lower().split())
+    """Single normalization helper shared with canonicalization/relationship rules.
+
+    Folds underscores and hyphens as well as case and whitespace, so identity
+    keys agree with ``relationship_rules.normalize_text``. Without this,
+    ``total_income`` and ``total income`` were one entity to the relationship
+    layer but two distinct identities to the storage layer.
+    """
+    return normalize_token(value)

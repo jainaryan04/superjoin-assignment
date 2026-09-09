@@ -11,10 +11,12 @@ from pathlib import Path
 
 from database import (
     RELATIONSHIP_TYPES,
+    existing_relationship_keys,
     format_fact_statement,
     get_connection,
     get_fact,
     insert_relationship,
+    insert_relationships_bulk,
     list_all_relationships,
     list_facts_for_document,
     rebuild_fact_clusters,
@@ -24,6 +26,7 @@ from database import (
 from fact_extractor import LLMClient, _parse_json_object
 from relationship_rules import (
     allowed_relationship_types,
+    fact_dimension,
     classify_relationship_detail,
     fact_canonical_attribute,
     filter_relationship_candidates,
@@ -31,11 +34,15 @@ from relationship_rules import (
     is_hierarchical_child,
     is_revenue_child_of_total,
     is_sibling,
+    attribute_core,
+    normalize_text,
+    reset_relationship_caches,
     numeric_amount,
     pair_evidence_ids,
     relationship_explanation,
     revenue_category,
     same_period,
+    values_comparable,
     values_corroborate,
     values_equivalent,
 )
@@ -85,6 +92,8 @@ def link_fact_relationships(
     """
     global _candidate_log
     _candidate_log = []
+    reset_relationship_caches()
+    _FACT_INDEX_CACHE.clear()
     facts = list_facts_for_document(None, db_path=db_path)
     _attach_evidence(facts, db_path)
     # Canonical order so parent iteration (and every relation it emits) is
@@ -98,10 +107,11 @@ def link_fact_relationships(
     duplicate_removed = 0
     seen: set[tuple[str, str, str]] = set()
 
+    doc_index = build_document_index(facts)
     relations = _cross_reason_links(facts)
     relations.extend(_computed_support_links(facts))
     for parent in facts:
-        nearby = _nearby_facts(parent, facts, nearby_page_window)
+        nearby = _nearby_facts(parent, facts, nearby_page_window, doc_index)
         plausible, filter_rejects = filter_relationship_candidates(parent, nearby)
         for item in filter_rejects:
             item.setdefault("confidence", 0.0)
@@ -116,6 +126,9 @@ def link_fact_relationships(
 
     raw_generated = len(relations)
     wrote = 0
+    stored_keys = existing_relationship_keys(db_path=db_path)
+    pending: list[dict[str, Any]] = []
+    pending_rows: list[dict[str, Any]] = []
     for relation in _dedupe_relations(relations):
         source_id = str(relation.get("source_fact_id") or "")
         target_id = str(relation.get("target_fact_id") or "")
@@ -159,8 +172,15 @@ def link_fact_relationships(
             )
             _candidate_log.append(row)
             continue
-        already = key in seen or relationship_exists(source_id, target_id, rel_type, db_path=db_path)
-        if insert_relationship(
+        already = key in seen or key in stored_keys
+        seen.add(key)
+        if already:
+            duplicate_removed += 1
+            row["accepted"] = True
+            row["reason"] = "Merged into existing relationship."
+            _candidate_log.append(row)
+            continue
+        pending.append(
             {
                 "source_fact_id": source_id,
                 "target_fact_id": target_id,
@@ -170,24 +190,21 @@ def link_fact_relationships(
                 "supporting_fact_ids": relation.get("supporting_fact_ids") or [],
                 "supporting_evidence_ids": relation.get("supporting_evidence_ids") or [],
                 "computed_components": relation.get("computed_components") or [],
-            },
-            db_path=db_path,
-        ):
+            }
+        )
+        pending_rows.append(row)
+
+    for item, row, inserted in zip(
+        pending, pending_rows, insert_relationships_bulk(pending, db_path=db_path)
+    ):
+        if inserted:
             wrote += 1
-            seen.add(key)
             row["accepted"] = True
-            _candidate_log.append(row)
         else:
-            if already:
-                duplicate_removed += 1
-                row["accepted"] = True
-                row["reason"] = "Merged into existing relationship."
-            else:
-                rejected += 1
-                row["accepted"] = False
-                row["reason"] = "Duplicate or invalid insert."
-            seen.add(key)
-            _candidate_log.append(row)
+            duplicate_removed += 1
+            row["accepted"] = True
+            row["reason"] = "Merged into existing relationship."
+        _candidate_log.append(row)
 
     if wrote:
         touched = 1
@@ -248,6 +265,9 @@ def _fact_evidence_doc_pages(fact: dict[str, Any]) -> dict[str, set[int]]:
     representative ``source_document`` / ``page_number``, so nearby-fact
     discovery is identical regardless of which row survived a cluster merge.
     """
+    cached = fact.get("_doc_pages")
+    if cached is not None:
+        return cached
     doc_pages: dict[str, set[int]] = {}
     for item in fact.get("evidence") or []:
         doc = str(item.get("source_document") or "").strip()
@@ -265,6 +285,7 @@ def _fact_evidence_doc_pages(fact: dict[str, Any]) -> dict[str, set[int]]:
                 doc_pages[doc] = {int(fact.get("page_number") or 0)}
             except (TypeError, ValueError):
                 doc_pages[doc] = {0}
+    fact["_doc_pages"] = doc_pages
     return doc_pages
 
 
@@ -287,18 +308,107 @@ def _facts_share_document(
     return False
 
 
+REVENUE_CHILD_CATEGORIES = {
+    "product_revenue",
+    "services_revenue",
+    "subscription_revenue",
+    "licensing_revenue",
+}
+
+
+def _attribute_core_key(fact: dict[str, Any]) -> str:
+    return attribute_core(fact.get("raw_attribute") or fact.get("attribute"))
+
+
+def build_document_index(facts: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Per-document lookup tables for candidate discovery.
+
+    Nearby-fact discovery must not scan the corpus (or a whole document) for
+    every parent: with two large PDFs that is ~N^2 pair tests. Instead we index
+    each document by the three keys that can possibly yield a relationship --
+    comparison bucket, revenue category, and attribute core -- and look
+    candidates up directly.
+    """
+    facts = list(facts)
+    by_doc: dict[str, list[dict[str, Any]]] = {}
+    bucket: dict[tuple[str, tuple[str, str]], list[dict[str, Any]]] = {}
+    revenue: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    core: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for fact in facts:
+        fact_bucket = _comparison_bucket(fact)
+        fact_revenue = revenue_category(fact)
+        fact_core = _attribute_core_key(fact)
+        for doc in _fact_evidence_doc_pages(fact):
+            by_doc.setdefault(doc, []).append(fact)
+            bucket.setdefault((doc, fact_bucket), []).append(fact)
+            if fact_revenue:
+                revenue.setdefault((doc, fact_revenue), []).append(fact)
+            if fact_core:
+                core.setdefault((doc, fact_core), []).append(fact)
+    return {"by_doc": by_doc, "bucket": bucket, "revenue": revenue, "core": core}
+
+
+def _plausible_partner(
+    parent: dict[str, Any],
+    candidate: dict[str, Any],
+    parent_bucket: tuple[str, str],
+) -> bool:
+    """Cheap prefilter for document-local candidates.
+
+    Everything downstream (PART_OF heuristics and the candidate filter) can only
+    fire for a hierarchical pair, a sibling pair, or a pair in the same
+    comparison bucket. Testing that here keeps the per-parent sweep proportional
+    to genuine candidates instead of the whole document.
+    """
+    return (
+        is_hierarchical_child(candidate, parent)
+        or is_hierarchical_child(parent, candidate)
+        or is_sibling(candidate, parent)
+        or _comparison_bucket(candidate) == parent_bucket
+    )
+
+
 def _nearby_facts(
     parent: dict[str, Any],
     facts: Iterable[dict[str, Any]],
     page_window: int,
+    doc_index: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     parent_id = str(parent.get("id") or "")
-    nearby: list[dict[str, Any]] = []
-    for fact in facts:
-        if str(fact.get("id") or "") == parent_id:
-            continue
-        if _facts_share_document(parent, fact, page_window):
-            nearby.append(fact)
+    if doc_index is None:
+        doc_index = build_document_index(facts)
+    parent_bucket = _comparison_bucket(parent)
+    parent_revenue = revenue_category(parent)
+    parent_core = _attribute_core_key(parent)
+
+    # Only the revenue categories that can pair hierarchically with this parent.
+    wanted_revenue: set[str] = set()
+    if parent_revenue == "total_revenue":
+        wanted_revenue |= REVENUE_CHILD_CATEGORIES
+    elif parent_revenue in REVENUE_CHILD_CATEGORIES:
+        wanted_revenue |= {"total_revenue"} | REVENUE_CHILD_CATEGORIES
+
+    candidates: dict[str, dict[str, Any]] = {}
+    for doc in _fact_evidence_doc_pages(parent):
+        groups: list[list[dict[str, Any]]] = [
+            doc_index["bucket"].get((doc, parent_bucket), [])
+        ]
+        for category in wanted_revenue:
+            groups.append(doc_index["revenue"].get((doc, category), []))
+        if parent_core:
+            groups.append(doc_index["core"].get((doc, parent_core), []))
+        for group in groups:
+            for fact in group:
+                fact_id = str(fact.get("id") or "")
+                if fact_id and fact_id != parent_id:
+                    candidates[fact_id] = fact
+
+    nearby = [
+        fact
+        for fact in candidates.values()
+        if _facts_share_document(parent, fact, page_window)
+        and _plausible_partner(parent, fact, parent_bucket)
+    ]
     nearby.sort(key=_canonical_sort_key)
     return nearby
 
@@ -328,21 +438,16 @@ def _heuristic_links(
         return []
 
     summing_ids: set[str] = set()
-    scored: list[tuple[dict[str, Any], float]] = []
     if parent_amount is not None:
+        scored: list[tuple[dict[str, Any], float]] = []
         for candidate in children:
             amount, unit = parse_amount(candidate.get("value"), candidate.get("unit"))
             if amount is None or not units_compatible(parent_unit, unit):
                 continue
             scored.append((candidate, amount))
-        for size in range(min(6, len(scored)), 1, -1):
-            for combo in itertools.combinations(scored, size):
-                total = sum(item[1] for item in combo)
-                if amounts_match(total, parent_amount):
-                    summing_ids = {item[0]["id"] for item in combo}
-                    break
-            if summing_ids:
-                break
+        summing_ids = {
+            str(item[0]["id"]) for item in _find_summing_subset(scored, parent_amount)
+        }
 
     links: list[dict[str, Any]] = []
     for candidate in children:
@@ -427,10 +532,36 @@ def _attach_evidence(facts: list[dict[str, Any]], db_path: str | None) -> None:
         fact["supporting_documents"] = _fact_supporting_documents(fact)
 
 
+def _comparison_bucket(fact: dict[str, Any]) -> tuple[str, str]:
+    """Key identifying facts that could possibly relate to one another.
+
+    ``classify_relationship_detail`` rejects any pair whose canonical attribute
+    or entity identity differs, so only same-bucket pairs can yield a link.
+    Bucketing turns the corpus-wide O(N^2) sweep into the sum of much smaller
+    per-bucket sweeps.
+    """
+    return (
+        fact_canonical_attribute(fact),
+        normalize_text(
+            fact.get("original_entity")
+            or fact.get("canonical_entity")
+            or fact.get("entity")
+        ),
+    )
+
+
 def _cross_reason_links(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Emit corroboration, contradiction, and evidence-backed reconciliation pairs."""
     links: list[dict[str, Any]] = []
-    for left, right in itertools.combinations(facts, 2):
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for fact in facts:
+        buckets.setdefault(_comparison_bucket(fact), []).append(fact)
+    pairs = itertools.chain.from_iterable(
+        itertools.combinations(group, 2)
+        for group in (buckets[key] for key in sorted(buckets))
+        if len(group) > 1
+    )
+    for left, right in pairs:
         detail = classify_relationship_detail(left, right, cohort=facts)
         if detail is None:
             continue
@@ -471,59 +602,75 @@ def _cross_reason_links(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return links
 
 
+# Subset-sum over more candidates than this is skipped: C(16, 8) is already
+# ~13k combinations and a legitimate revenue breakdown never has that many
+# same-period components. Keeps a large, poorly-canonicalized corpus from
+# triggering a combinatorial blow-up.
+_MAX_SUM_CANDIDATES = 16
+
+
+def _revenue_scope_key(fact: dict[str, Any]) -> tuple[str, str]:
+    """Entity + period a revenue component must share with its total."""
+    return (
+        normalize_text(fact.get("canonical_entity") or fact.get("entity")),
+        normalize_text(fact.get("period")),
+    )
+
+
+def _find_summing_subset(
+    scored: list[tuple[dict[str, Any], float]], target_amount: float
+) -> list[tuple[dict[str, Any], float]]:
+    """First subset (largest first) whose amounts sum to the target, or []."""
+    if len(scored) > _MAX_SUM_CANDIDATES:
+        return []
+    for size in range(min(6, len(scored)), 1, -1):
+        for combo in itertools.combinations(scored, size):
+            if amounts_match(sum(item[1] for item in combo), target_amount):
+                return list(combo)
+    return []
+
+
 def _computed_support_links(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     links: list[dict[str, Any]] = []
     totals = sorted(
         (fact for fact in facts if revenue_category(fact) == "total_revenue"),
         key=_canonical_sort_key,
     )
-    children = sorted(
-        (
-            fact
-            for fact in facts
-            if revenue_category(fact)
-            in {
-                "product_revenue",
-                "services_revenue",
-                "subscription_revenue",
-                "licensing_revenue",
-            }
-        ),
-        key=_canonical_sort_key,
-    )
+    # Bucket components by entity+period; a total is only ever the sum of its
+    # own-period, own-entity children, so each parent searches a handful of
+    # candidates instead of every revenue child in the corpus.
+    children_by_scope: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for fact in facts:
+        if revenue_category(fact) in {
+            "product_revenue",
+            "services_revenue",
+            "subscription_revenue",
+            "licensing_revenue",
+        }:
+            children_by_scope.setdefault(_revenue_scope_key(fact), []).append(fact)
+    for group in children_by_scope.values():
+        group.sort(key=_canonical_sort_key)
+
     for parent in totals:
         parent_amount, parent_unit = numeric_amount(parent)
         if parent_amount is None:
             continue
+        candidates = children_by_scope.get(_revenue_scope_key(parent), [])
         scored: list[tuple[dict[str, Any], float]] = []
-        for child in children:
+        for child in candidates:
             amount, unit = numeric_amount(child)
             if amount is None:
                 continue
             if parent_unit and unit and parent_unit != unit:
                 continue
             scored.append((child, amount))
-        # Fix the combination order (by canonical identity) so the chosen
-        # components, the equation string, and combo_ids[0] -> target_fact_id do
-        # not depend on cluster-merge order.
         scored.sort(key=lambda pair: _canonical_sort_key(pair[0]))
-        combo_ids: list[str] = []
-        combo_facts: list[dict[str, Any]] = []
-        combo_amounts: list[float] = []
-        for size in range(min(6, len(scored)), 1, -1):
-            found = False
-            for combo in itertools.combinations(scored, size):
-                total = sum(item[1] for item in combo)
-                if amounts_match(total, parent_amount):
-                    combo_facts = [item[0] for item in combo]
-                    combo_amounts = [item[1] for item in combo]
-                    combo_ids = [str(item[0]["id"]) for item in combo]
-                    found = True
-                    break
-            if found:
-                break
-        if not combo_ids:
+        combo = _find_summing_subset(scored, parent_amount)
+        if not combo:
             continue
+        combo_facts = [item[0] for item in combo]
+        combo_amounts = [item[1] for item in combo]
+        combo_ids = [str(item[0]["id"]) for item in combo]
         equation = " + ".join(f"{amount:g}" for amount in combo_amounts) + f" = {parent_amount:g}"
         links.append(
             {
@@ -625,10 +772,22 @@ def _llm_links(
 
 
 def _fact_by_id(facts: list[dict[str, Any]], fact_id: str) -> dict[str, Any] | None:
-    for fact in facts:
-        if fact.get("id") == fact_id:
-            return fact
-    return None
+    return _fact_index(facts).get(str(fact_id))
+
+
+# Keyed by id() of the cohort list; cleared at the top of link_fact_relationships.
+_FACT_INDEX_CACHE: dict[int, tuple[int, dict[str, dict[str, Any]]]] = {}
+
+
+def _fact_index(facts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """id -> fact map, memoised so lookups are O(1) not O(N) per relation."""
+    key = id(facts)
+    cached = _FACT_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] == len(facts):
+        return cached[1]
+    index = {str(f.get("id")): f for f in facts}
+    _FACT_INDEX_CACHE[key] = (len(facts), index)
+    return index
 
 
 def _fact_brief(fact: dict[str, Any]) -> dict[str, Any]:
@@ -663,6 +822,16 @@ def validate_relationship(
     target_id = str(target.get("id") or target.get("target_fact_id") or "")
     if source_id and target_id and source_id == target_id:
         return {"ok": False, "result": "FAILED", "reason": "Self-links are not allowed."}
+    if rel_type in {"CONTRADICTS", "CORROBORATES"} and not values_comparable(source, target):
+        return {
+            "ok": False,
+            "result": "FAILED",
+            "reason": (
+                f"Incomparable value dimensions "
+                f"({fact_dimension(source)} vs {fact_dimension(target)})."
+            ),
+        }
+
     if rel_type == "CONTRADICTS":
         if fact_canonical_attribute(source) != fact_canonical_attribute(target):
             return {

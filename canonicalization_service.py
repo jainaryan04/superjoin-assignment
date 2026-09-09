@@ -48,8 +48,38 @@ EMPLOYEE_ALIASES = {
     "head count",
     "staff",
     "workforce",
+    "workforce strength",
+    "staff strength",
     "number of employees",
     "no of employees",
+    "total employees",
+    "total headcount",
+    "permanent employees",
+}
+
+# A headcount attribute is a bare count phrase, optionally qualified.
+HEADCOUNT_PHRASE_RE = re.compile(
+    r"^(?:total\s+|average\s+|permanent\s+|contract\s+|number\s+of\s+|no\.?\s+of\s+)*"
+    r"(?:employees?|headcount|head\s?count|workforce|staff)"
+    r"(?:\s+(?:count|strength|number))?$"
+)
+# Fragments that make an attribute a money/ratio/derived metric, never a headcount.
+NON_HEADCOUNT_RE = re.compile(
+    r"\b(salary|salaries|benefit|benefits|compensation|option|options|share|shares|"
+    r"percent|percentage|pct|cost|costs|contribution|expense|expenses|revenue|"
+    r"payable|insurance|turnover|ratio|margin|rate|amount|value|esic|healthcare|"
+    r"session|training|attrition|wage|wages|remuneration|bonus)\b"
+)
+# Ratio / derived metrics that must not collapse into a level metric such as
+# total_revenue (e.g. percentage_of_total_revenue, CAGR, growth_rate).
+DERIVED_METRIC_RE = re.compile(
+    r"\b(percentage|percent|pct|ratio|margin|cagr|growth|yoy|y o y|increase|"
+    r"decrease|proportion|share of|per share)\b"
+)
+
+CURRENCY_UNIT_WORDS = {
+    "inr", "usd", "eur", "gbp", "rs", "rupee", "rupees", "dollar", "dollars",
+    "euro", "euros", "pound", "pounds",
 }
 
 CEO_ALIASES = {
@@ -192,14 +222,32 @@ def canonicalize_fact(fact: dict[str, Any]) -> dict[str, Any]:
     raw_attribute = str(out.get("raw_attribute") or raw_attribute).strip()
 
     canonical_attr = infer_canonical_attribute(out, raw_attribute)
-    canonical_entity = canonicalize_entity(out.get("entity"), canonical_attr, raw_attribute)
     canonical_value = canonicalize_value(out.get("value"), unit, canonical_attr)
+    # Guard against value/attribute contradictions the attribute name alone can't
+    # catch: a headcount that is money / a percentage / a scaled magnitude, or a
+    # revenue *level* whose value is a ratio. Demote to a generic attribute so
+    # the mislabel does not pollute a clean metric bucket.
+    if _demote_on_value_conflict(canonical_attr, canonical_value, unit) != canonical_attr:
+        fallback = to_snake(strip_period_tokens(raw_attribute)) or "value"
+        # The fallback must not land back on a conflicting metric bucket.
+        if (
+            fallback in TEMPORAL_ATTRIBUTES
+            or _demote_on_value_conflict(fallback, canonical_value, unit) != fallback
+        ):
+            fallback = "value"
+        canonical_attr = fallback
+        out["attribute"] = canonical_attr
+        canonical_value = canonicalize_value(out.get("value"), unit, canonical_attr)
+    canonical_entity = canonicalize_entity(out.get("entity"), canonical_attr, raw_attribute)
 
     out["canonical_attribute"] = canonical_attr
     out["canonical_entity"] = canonical_entity
     out["canonical_value"] = canonical_value
+    out["currency"] = canonicalize_currency_code(out.get("value"), unit) or None
     out["attribute"] = canonical_attr
-    if canonical_attr in {"holder", "employee_count"} or not str(out.get("entity") or "").strip():
+    # Only fill an empty entity; the observed subject is never overwritten so a
+    # second canonicalization pass sees the same inputs as the first.
+    if not str(out.get("entity") or "").strip():
         out["entity"] = canonical_entity
     return out
 
@@ -237,6 +285,9 @@ def infer_canonical_attribute(fact: dict[str, Any], raw_attribute: str | None = 
 
 def infer_revenue_attribute(raw: str, entity: str) -> str | None:
     text = strip_period_tokens(f"{raw} {entity}")
+    # A ratio or derived metric about revenue is not a revenue level.
+    if DERIVED_METRIC_RE.search(normalize_token(text)):
+        return None
     has_revenue = bool(REVENUE_RE.search(text) or re.search(r"\b(turnover|sales)\b", text))
     for prefix, canonical in REVENUE_CHILD_PREFIXES:
         if re.search(rf"\b{prefix}\b", text) and (has_revenue or prefix in {"software", "consulting"}):
@@ -277,27 +328,43 @@ def canonicalize_entity(entity: Any, canonical_attribute: str, raw_attribute: st
 
 
 def apply_entity_resolution(fact: dict[str, Any], raw_attribute: str) -> None:
-    """Map employee/CEO surface forms onto stable entity/attribute pairs."""
+    """Map employee/CEO surface forms onto stable attribute names.
+
+    Never writes ``fact["entity"]``: the observed subject is preserved and the
+    derived name lives in ``canonical_entity``. Mutating entity here made
+    ``infer_canonical_attribute`` read its own output, so canonicalizing an
+    already-canonicalized fact could change the result.
+    """
     entity = str(fact.get("entity") or "").strip()
     value = str(fact.get("value") or "").strip()
     if is_ceo_role(raw_attribute, entity, value):
         person = extract_person_name(entity, raw_attribute, value)
         if person:
-            fact["entity"] = "CEO"
             fact["attribute"] = "holder"
             fact["raw_attribute"] = raw_attribute or "holder"
             fact["value"] = person
         return
-    if is_employee_metric(raw_attribute, entity):
-        fact["entity"] = "Employees"
+    if is_employee_metric(raw_attribute):
         fact["attribute"] = "employee_count"
 
 
 def is_employee_metric(attribute: Any, entity: Any = None) -> bool:
-    text = normalize_token(f"{attribute or ''} {entity or ''}")
+    """True only for genuine headcount attributes.
+
+    Matches an exact alias or a bare headcount phrase; never an arbitrary
+    substring, so ``salary_and_other_employee_benefits`` and
+    ``percentage_of_female_employees`` are rejected. ``entity`` is accepted for
+    call compatibility but deliberately ignored: entity is resolved downstream
+    and reading it here made attribute inference depend on its own output.
+    """
+    text = normalize_token(attribute)
+    if not text:
+        return False
+    if NON_HEADCOUNT_RE.search(text):
+        return False
     if text in EMPLOYEE_ALIASES:
         return True
-    return bool(re.search(r"\b(employee|employees|headcount|workforce|staff)\b", text))
+    return bool(HEADCOUNT_PHRASE_RE.match(text))
 
 
 def is_ceo_role(attribute: Any, entity: Any = None, value: Any = None) -> bool:
@@ -369,14 +436,40 @@ def canonicalize_period(*parts: Any) -> str:
     return f"{prefix}{year}"
 
 
+def is_currency_token(text: Any) -> bool:
+    """True when a bare unit string is a currency, not a magnitude scale."""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if raw in {"₹", "$", "€", "£"}:
+        return True
+    return normalize_token(raw).rstrip(".") in CURRENCY_UNIT_WORDS
+
+
+def canonicalize_currency_code(value: Any, unit: Any = None) -> str:
+    """Currency for a value/unit pair, or '' when the value is not monetary."""
+    blob = f"{value or ''} {unit or ''}"
+    lower = blob.lower()
+    for token, code in CURRENCY_SYMBOLS:
+        if token in lower or token in blob:
+            return code
+    return ""
+
+
 def canonicalize_unit(unit: Any, value: Any = None) -> str:
+    """Magnitude scale only. Currency is a separate dimension (see
+    ``canonicalize_currency_code``) and must never be echoed back as a unit,
+    otherwise ``INR``/``₹`` produce two identities for one value."""
     text = f"{unit or ''} {value or ''}".lower()
     if "%" in text:
         return "%"
     for token, canonical in UNIT_ALIASES.items():
         if re.search(rf"\b{re.escape(token)}\b", text):
             return canonical
-    return str(unit or "").strip()
+    raw = str(unit or "").strip()
+    if is_currency_token(raw):
+        return ""
+    return raw
 
 
 def canonicalize_value(value: Any, unit: str | None = None, attribute: Any = None) -> str:
@@ -395,6 +488,12 @@ def canonicalize_value(value: Any, unit: str | None = None, attribute: Any = Non
 
 
 def canonicalize_currency(value: Any, unit: Any = None) -> str | None:
+    """Render a monetary value as ``amount [CURRENCY] [scale]``.
+
+    Each slot is emitted at most once, so ``₹15.36`` with unit ``INR`` and the
+    same value with unit ``₹`` both render ``15.36 INR`` instead of the previous
+    ``15.36 INR INR`` / ``15.36 INR ₹``.
+    """
     blob = f"{value or ''} {unit or ''}"
     compact = blob.replace(",", "")
     match = _AMOUNT_RE.search(compact)
@@ -402,11 +501,7 @@ def canonicalize_currency(value: Any, unit: Any = None) -> str | None:
         return None
     amount = float(match.group().replace(",", ""))
     lower = blob.lower()
-    currency = None
-    for token, code in CURRENCY_SYMBOLS:
-        if token in lower or token in blob:
-            currency = code
-            break
+    currency = canonicalize_currency_code(value, unit)
     unit_n = canonicalize_unit(unit, value)
     if not currency and not unit_n and "₹" not in blob and "$" not in blob:
         if not re.search(r"\b(inr|usd|eur|gbp|rs|rupee|crore|lakh|million|billion)\b", lower):
@@ -414,7 +509,7 @@ def canonicalize_currency(value: Any, unit: Any = None) -> str | None:
     parts = [f"{amount:g}"]
     if currency:
         parts.append(currency)
-    if unit_n:
+    if unit_n and unit_n != currency:
         parts.append(unit_n)
     return " ".join(parts)
 
@@ -473,6 +568,96 @@ def canonicalize_address(value: Any) -> str:
     lower = re.sub(r",\s*", ", ", lower)
     lower = re.sub(r"\s+\.", ".", lower)
     return " ".join(lower.split())
+
+
+COUNT_UNIT_RE = re.compile(
+    r"\b(shares?|equity shares?|options?|units?|parcels?|customers?|employees?|people|persons?)\b",
+    re.IGNORECASE,
+)
+SCALE_RE = re.compile(r"\b(crore|lakh|million|billion|thousand)\b", re.IGNORECASE)
+
+# Which value dimensions may be compared with each other. Comparing across
+# dimensions (money vs ratio) is meaningless, not a disagreement.
+DIMENSION_COMPATIBILITY: dict[str, set[str]] = {
+    "ratio": {"ratio"},
+    "count": {"count", "plain"},
+    "money": {"money", "scaled", "plain"},
+    "scaled": {"money", "scaled", "plain"},
+    "plain": {"money", "scaled", "plain", "count"},
+}
+
+
+_HEADCOUNT_NOISE_RE = re.compile(
+    r"[%₹$€£]|\b(share|shares|option|options|parcel|parcels|equity|percent|pct|"
+    r"crore|lakh|million|billion|thousand|mn|bn|inr|usd|eur|gbp|rs)\b",
+    re.IGNORECASE,
+)
+
+
+_LEVEL_ATTRIBUTES = {
+    "total_revenue", "product_revenue", "services_revenue",
+    "subscription_revenue", "licensing_revenue", "revenue",
+}
+
+
+def _demote_on_value_conflict(
+    canonical_attr: str, canonical_value: Any, unit: Any
+) -> str:
+    """Return a replacement attribute when the value contradicts the metric.
+
+    ``''`` means "demote, but the caller must choose the fallback name".
+    Returning ``canonical_attr`` unchanged means the fact is consistent.
+    """
+    if canonical_attr == "employee_count" and not is_plausible_headcount(canonical_value, unit):
+        return ""
+    if canonical_attr in _LEVEL_ATTRIBUTES and value_dimension(canonical_value, unit) == "ratio":
+        return ""
+    return canonical_attr
+
+
+def is_plausible_headcount(value: Any, unit: Any = None) -> bool:
+    """A headcount is a bare whole number under a sane ceiling.
+
+    Rejects money, percentages, scaled magnitudes, and share/parcel counts that
+    the extractor mislabelled as employee_count.
+    """
+    blob = f"{value or ''} {unit or ''}"
+    if _HEADCOUNT_NOISE_RE.search(blob):
+        return False
+    match = _AMOUNT_RE.search(blob.replace(",", ""))
+    if match is None:
+        return False
+    try:
+        number = float(match.group())
+    except ValueError:
+        return False
+    return 0 <= number <= 5_000_000 and number == int(number)
+
+
+def value_dimension(value: Any, unit: Any = None) -> str:
+    """Classify a value as money / ratio / count / scaled / plain."""
+    blob = f"{value or ''} {unit or ''}"
+    if "%" in blob:
+        return "ratio"
+    if canonicalize_currency_code(value, unit):
+        return "money"
+    if COUNT_UNIT_RE.search(blob):
+        return "count"
+    if SCALE_RE.search(blob):
+        return "scaled"
+    return "plain"
+
+
+def dimensions_compatible(
+    left_value: Any,
+    left_unit: Any = None,
+    right_value: Any = None,
+    right_unit: Any = None,
+) -> bool:
+    """True when two values are of comparable kinds."""
+    left = value_dimension(left_value, left_unit)
+    right = value_dimension(right_value, right_unit)
+    return right in DIMENSION_COMPATIBILITY.get(left, {left})
 
 
 def normalized_value_key(value: Any, unit: Any = None) -> str:
