@@ -96,23 +96,33 @@ def same_entity(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return left_entity == right_entity
 
 
+# Words that only qualify a metric, not the subject it belongs to. "Annual
+# Revenue" and "Revenue" are the same subject; "Acme" and "Globex" are not.
+_ENTITY_QUALIFIERS = {
+    "annual", "total", "net", "gross", "consolidated", "combined", "overall",
+    "group", "reported", "restated", "adjusted", "the", "a",
+}
+
+
+def _entity_identity_key(fact: dict[str, Any]) -> str:
+    raw = normalize_text(
+        fact.get("original_entity")
+        or fact.get("canonical_entity")
+        or fact.get("entity")
+    )
+    stripped = " ".join(p for p in raw.split() if p not in _ENTITY_QUALIFIERS)
+    return stripped or raw
+
+
 def same_entity_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
     """Entity identity for cross-fact reasoning.
 
-    Prefer the pre-canonicalization ``original_entity``; fall back to
-    ``canonical_entity`` (then ``entity``) only when it is unavailable.
-    CEO / employee_count facts all canonicalize to the same entity, so relying on
-    ``canonical_entity`` alone would link facts from different companies.
+    Uses the pre-canonicalization ``original_entity`` (so two companies' CEOs,
+    which both canonicalize to "CEO", are never linked), but ignores pure metric
+    qualifiers so an extractor that writes "Annual Revenue" in one document and
+    "Revenue" in another is still recognised as the same subject.
     """
-
-    def key(fact: dict[str, Any]) -> str:
-        return normalize_text(
-            fact.get("original_entity")
-            or fact.get("canonical_entity")
-            or fact.get("entity")
-        )
-
-    return key(left) == key(right)
+    return _entity_identity_key(left) == _entity_identity_key(right)
 
 
 def canonical_period(fact: dict[str, Any]) -> str:
