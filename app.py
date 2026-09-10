@@ -22,26 +22,48 @@ from fact_details import render_fact_details
 
 load_dotenv()
 
-# On Streamlit Cloud the API key lives in st.secrets. Mirror the known settings
-# into the environment so os.getenv (used across the app) sees them, and so a
-# key added under a [section] in the Secrets editor still works.
-try:
-    for _name in (
-        "OPENAI_API_KEY", "LLM_API_KEY",
-        "OPENAI_MODEL", "LLM_MODEL",
-        "OPENAI_BASE_URL", "LLM_BASE_URL",
-    ):
-        _val = st.secrets.get(_name)
-        if not _val:
-            for _section in ("openai", "llm", "general", "env"):
-                _block = st.secrets.get(_section)
-                if _block and _block.get(_name):
-                    _val = _block[_name]
-                    break
-        if _val and not os.getenv(_name):
-            os.environ[_name] = str(_val)
-except Exception:
-    pass
+
+def _bridge_streamlit_secrets() -> list[str]:
+    """Copy anything key-shaped from st.secrets into the environment.
+
+    Streamlit Cloud stores deployment secrets in ``st.secrets`` and does not
+    reliably export them as env vars, so the whole app (which reads ``os.getenv``)
+    misses them. This scans every top-level entry and every ``[section]`` for the
+    settings we use, case-insensitively. Returns the names of the secrets it saw
+    (never their values) for the diagnostic below.
+    """
+    wanted = {
+        "openai_api_key": "OPENAI_API_KEY",
+        "llm_api_key": "LLM_API_KEY",
+        "api_key": "OPENAI_API_KEY",
+        "openai_model": "OPENAI_MODEL",
+        "llm_model": "LLM_MODEL",
+        "model": "OPENAI_MODEL",
+        "openai_base_url": "OPENAI_BASE_URL",
+        "llm_base_url": "LLM_BASE_URL",
+        "base_url": "OPENAI_BASE_URL",
+    }
+    seen: list[str] = []
+    try:
+        items = list(st.secrets.items())
+    except Exception:
+        return seen
+    for key, value in items:
+        if hasattr(value, "items"):  # a [section]
+            for sub_key, sub_value in value.items():
+                seen.append(f"{key}.{sub_key}")
+                target = wanted.get(str(sub_key).lower())
+                if target and sub_value and not os.getenv(target):
+                    os.environ[target] = str(sub_value)
+        else:
+            seen.append(str(key))
+            target = wanted.get(str(key).lower())
+            if target and value and not os.getenv(target):
+                os.environ[target] = str(value)
+    return seen
+
+
+_secret_names = _bridge_streamlit_secrets()
 
 init_db()
 
@@ -76,6 +98,18 @@ with st.sidebar:
         "Replace facts for re-uploaded documents",
         value=True,
     )
+    if not api_key:
+        st.warning("No API key found in env, .env, secrets, or the field above.")
+        with st.expander("What the app can see"):
+            st.write("st.secrets entries:", _secret_names or "(none)")
+            st.write(
+                "env OPENAI_API_KEY set:",
+                bool(os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")),
+            )
+            st.caption(
+                "On Streamlit Cloud, put `OPENAI_API_KEY = \"sk-...\"` in "
+                "Settings → Secrets (top level), then Reboot the app."
+            )
     st.divider()
     if st.button("Clear all stored facts", type="secondary"):
         clear_all_facts()

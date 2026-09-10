@@ -181,16 +181,17 @@ def _from_streamlit_secrets(name: str) -> str | None:
     checks both shapes. Import is lazy and guarded so nothing here depends on
     Streamlit (tests, CLI, and ``migrate.py`` never import it).
     """
+    aliases = {name.lower(), name.lower().replace("openai_", ""), name.lower().replace("llm_", "")}
     try:
         import streamlit as st  # noqa: PLC0415
 
-        value = st.secrets.get(name)
-        if value:
-            return str(value)
-        for section in ("openai", "llm", "general", "env"):
-            block = st.secrets.get(section)
-            if block and block.get(name):
-                return str(block[name])
+        for key, value in st.secrets.items():
+            if str(key).lower() in aliases and value:
+                return str(value)
+            if hasattr(value, "items"):
+                for sub_key, sub_value in value.items():
+                    if str(sub_key).lower() in aliases and sub_value:
+                        return str(sub_value)
     except Exception:
         return None
     return None
