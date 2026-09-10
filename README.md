@@ -2,6 +2,10 @@
 
 **Live app:** https://jainaryan04-superjoin-assignment.streamlit.app/
 
+> The hosted app already has an OpenAI key configured — just upload PDFs and click
+> **Extract facts**. Only enter a key in the sidebar if you want to try a
+> different model/provider.
+
 Upload PDFs → extract entity–attribute–value facts grounded in a verbatim source
 snippet → automatically link facts that **corroborate**, **contradict**, are
 **part of** a whole, or can be **reconciled** by context (time, scope, units,
